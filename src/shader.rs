@@ -54,15 +54,54 @@ impl<'a> From<Vec<ShaderEntryPoint<'a>>> for ShaderSet<'a> {
     }
 }
 
-pub struct BindGroupTemplate<'a> {
-    layout: wgpu::BindGroupLayout,
-    binding_types: HashMap<String, (u32, BindingType)>,
-    bindings: HashMap<u32, wgpu::BindingResource<'a>>,
+pub struct PipelineTemplate<'a> {
+    layouts: Vec<wgpu::BindGroupLayout>,
+    pipeline_layout: wgpu::PipelineLayout,
+    binding_types: HashMap<String, ((u32, u32), BindingType)>,
+    bindings: HashMap<(u32, u32), wgpu::BindingResource<'a>>,
 }
 
-impl<'a> BindGroupTemplate<'a> {
-    pub fn layout(&self) -> &wgpu::BindGroupLayout {
-        &self.layout
+impl<'a> PipelineTemplate<'a> {
+    pub fn compute_pipeline(
+        &self,
+        device: &wgpu::Device,
+        shader_set: &ShaderSet,
+    ) -> wgpu::ComputePipeline {
+        // TODO: assert that shader set is compatible
+        assert_eq!(shader_set.entry_points.len(), 1);
+        assert_eq!(
+            shader_set.entry_points[0].stage(),
+            wgpu::ShaderStage::COMPUTE
+        );
+
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&self.pipeline_layout),
+            module: &shader_set.entry_points[0].shader.module,
+            entry_point: &shader_set.entry_points[0].name(),
+        })
+    }
+
+    pub fn graphics_pipeline(
+        &self,
+        device: &wgpu::Device,
+        shader_set: &ShaderSet,
+        buffers: &'a [wgpu::VertexBufferLayout<'a>],
+        targets: &[wgpu::ColorTargetState],
+        depth_stencil: Option<wgpu::DepthStencilState>,
+    ) -> wgpu::RenderPipeline {
+        // TODO: assert that shader set is compatible
+        assert!(shader_set.entry_points.len() >= 1);
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&self.pipeline_layout),
+            vertex: shader_set.vertex_state(buffers),
+            fragment: shader_set.fragment_state(targets),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil,
+            multisample: wgpu::MultisampleState::default(),
+        })
     }
 
     // pub fn clear(&mut self) -> &mut Self {
@@ -80,10 +119,13 @@ impl<'a> BindGroupTemplate<'a> {
     // }
 
     pub fn bind(&mut self, name: &str, resource: impl IntoResource<'a>) -> &mut Self {
-        let (id, ty) = self
-            .binding_types
-            .get(name)
-            .unwrap_or_else(|| panic!("invalid binding name '{}'", name));
+        let (id, ty) = match self.binding_types.get(name) {
+            Some(b) => b,
+            None => {
+                // panic!("invalid binding name '{}'", name)
+                return self;
+            }
+        };
 
         let resource = resource.into();
         match (ty, &resource) {
@@ -100,18 +142,19 @@ impl<'a> BindGroupTemplate<'a> {
         self
     }
 
-    pub fn build(&self, device: &wgpu::Device) -> wgpu::BindGroup {
+    pub fn build_bind_group(&self, device: &wgpu::Device, group: u32) -> wgpu::BindGroup {
         let entries = self
             .bindings
             .iter()
-            .map(|(binding, resource)| wgpu::BindGroupEntry {
+            .filter(|((g, _), _)| *g == group)
+            .map(|((_, binding), resource)| wgpu::BindGroupEntry {
                 binding: *binding,
                 resource: resource.clone(),
             })
             .collect::<Vec<_>>();
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &self.layout,
+            layout: &self.layouts[group as usize],
             entries: &entries,
         })
     }
@@ -146,36 +189,36 @@ impl<'a> IntoResource<'a> for &'a wgpu::Buffer {
 // TODO: more into impls
 
 impl ShaderSet<'_> {
-    pub fn bind_group_template(&self, device: &wgpu::Device, group: u32) -> BindGroupTemplate {
-        let mut bindings = HashMap::<u32, wgpu::BindGroupLayoutEntry>::new();
+    pub fn pipeline_template(&self, device: &wgpu::Device) -> PipelineTemplate {
+        let mut bindings: Vec<HashMap<u32, wgpu::BindGroupLayoutEntry>> = Vec::new();
         let mut binding_types = HashMap::new();
         for ep in &self.entry_points {
             let ep_info = ep.shader.info.get_entry_point(ep.entry_point_index);
             let module = &ep.shader.naga_module;
             for (var_handle, var) in module.global_variables.iter() {
                 if let Some(ref binding) = var.binding {
-                    if binding.group != group {
-                        continue;
-                    }
-
                     let binding_use = ep_info[var_handle];
                     if !binding_use.is_empty() {
                         let ty = reflect_binding_type(&module, var, binding_use);
 
-                        match bindings.entry(binding.binding) {
+                        if bindings.len() <= binding.group as usize {
+                            bindings.resize_with(1 + binding.group as usize, Default::default);
+                        }
+                        let group_bindings = &mut bindings[binding.group as usize];
+                        match group_bindings.entry(binding.binding) {
                             Entry::Occupied(mut entry) => {
                                 let val = entry.get_mut();
                                 val.visibility |= ep.stage();
                                 merge_bindings(&mut val.ty, ty);
                                 binding_types.insert(
                                     var.name.clone().unwrap(),
-                                    (binding.binding, val.ty.clone()),
+                                    ((binding.group, binding.binding), val.ty.clone()),
                                 );
                             }
                             Entry::Vacant(entry) => {
                                 binding_types.insert(
                                     var.name.clone().unwrap(),
-                                    (binding.binding, ty.clone()),
+                                    ((binding.group, binding.binding), ty.clone()),
                                 );
                                 entry.insert(wgpu::BindGroupLayoutEntry {
                                     binding: binding.binding,
@@ -190,16 +233,62 @@ impl ShaderSet<'_> {
             }
         }
 
-        let entries = bindings.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let layouts = bindings
+            .into_iter()
+            .map(|map| {
+                let entries = map.into_iter().map(|(_, entry)| entry).collect::<Vec<_>>();
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &entries,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            entries: &entries,
+            bind_group_layouts: &layouts.iter().collect::<Vec<_>>(),
+            push_constant_ranges: &[],
         });
-        BindGroupTemplate {
-            layout,
+
+        PipelineTemplate {
+            layouts,
+            pipeline_layout,
             binding_types,
             bindings: HashMap::new(),
         }
+    }
+
+    pub fn vertex_state<'a>(
+        &'a self,
+        buffers: &'a [wgpu::VertexBufferLayout<'a>],
+    ) -> wgpu::VertexState<'a> {
+        let entry = self
+            .entry_points
+            .iter()
+            .find(|e| e.stage() == wgpu::ShaderStage::VERTEX)
+            .expect("Vertex shader required");
+
+        wgpu::VertexState {
+            module: &entry.shader.module,
+            entry_point: entry.name(),
+            buffers,
+        }
+    }
+
+    pub fn fragment_state<'a>(
+        &'a self,
+        targets: &'a [wgpu::ColorTargetState],
+    ) -> Option<wgpu::FragmentState<'a>> {
+        let entry = self
+            .entry_points
+            .iter()
+            .find(|e| e.stage() == wgpu::ShaderStage::FRAGMENT)?;
+
+        Some(wgpu::FragmentState {
+            module: &entry.shader.module,
+            entry_point: entry.name(),
+            targets,
+        })
     }
 }
 
@@ -431,6 +520,10 @@ impl<'a> ShaderEntryPoint<'a> {
             shader,
             entry_point_index,
         }
+    }
+
+    fn name(&self) -> &str {
+        &self.shader.naga_module.entry_points[self.entry_point_index].name
     }
 
     fn stage(&self) -> wgpu::ShaderStage {

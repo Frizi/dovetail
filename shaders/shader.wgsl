@@ -24,6 +24,11 @@ struct DrawCmd {
     first_instance: u32;
 };
 
+fn rotate_quat(v: vec3<f32>, q: vec4<f32>) -> vec3<f32>
+{
+	return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
 [[block]]
 struct MeshBuffer {
     meshes: array<Mesh>;
@@ -39,16 +44,19 @@ struct CmdBuffer {
     commands: array<DrawCmd>;
 };
 
-fn rotate_quat(v: vec3<f32>, q: vec4<f32>) -> vec3<f32>
-{
-	return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
-}
+[[block]]
+struct Camera {
+    view: mat4x4<f32>;
+    projection: mat4x4<f32>;
+};
 
 [[group(0), binding(0)]]
-var<storage> mesh_buffer: [[access(read)]] MeshBuffer;
+var<uniform> camera: Camera;
 [[group(0), binding(1)]]
-var<storage> mesh_draw_buffer: [[access(read)]] MeshDrawBuffer;
+var<storage> mesh_buffer: [[access(read)]] MeshBuffer;
 [[group(0), binding(2)]]
+var<storage> mesh_draw_buffer: [[access(read)]] MeshDrawBuffer;
+[[group(0), binding(3)]]
 var<storage> cmd_buffer: [[access(write)]] CmdBuffer;
 
 [[stage(compute), workgroup_size(32)]]
@@ -104,9 +112,9 @@ fn visibility_vs(
     let mesh_draw = mesh_draw_buffer.mesh_draws[instance_index];
     var pos: vec3<f32> = position;
     pos = rotate_quat(pos * mesh_draw.position_scale.w, mesh_draw.orientation) + mesh_draw.position_scale.xyz;
-    pos = vec3<f32>(pos.xy * 0.05, pos.z * 0.01 + 0.1);
+    // pos = vec3<f32>(pos.xy * 0.05, pos.z * 0.01 + 0.1);
     return VertexOutput(
-        vec4<f32>(pos * 5.0, 1.0),
+        camera.projection * camera.view * vec4<f32>(pos, 1.0),
         instance_index,
     );
 }
@@ -116,4 +124,3 @@ fn visibility_fs(input: VertexOutput) -> [[location(0)]] vec4<f32> {
     let rgb = hash_rgb(input.instance_index);
     return vec4<f32>(rgb, 1.0);
 }
-

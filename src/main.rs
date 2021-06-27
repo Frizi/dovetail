@@ -1,6 +1,7 @@
-use std::{fmt::Display, path::Path};
+use std::{f32::consts::PI, fmt::Display, path::Path};
 
-use glam::{Quat, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec3, Vec4};
+use tasks::Spawner;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::{
     event::{Event, WindowEvent},
@@ -9,6 +10,7 @@ use winit::{
 };
 
 mod shader;
+mod tasks;
 mod util;
 
 use shader::*;
@@ -88,6 +90,7 @@ fn load_mesh(
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct MeshDraw {
     position_scale: Vec4,
     orientation: Quat,
@@ -96,6 +99,7 @@ struct MeshDraw {
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Mesh {
     bound_sphere: Vec4,
     vertex_offset: u32,
@@ -103,14 +107,23 @@ struct Mesh {
     levels: [MeshLod; 8],
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Camera {
+    view: Mat4,
+    projection: Mat4,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct MeshLod {
     index_offset: u32,
     index_count: u32,
 }
 
 async fn run(event_loop: EventLoop<()>, window: Window) {
+    let spawner = Spawner::new();
     let instance = wgpu::Instance::new(wgpu::BackendBit::all());
     let surface = unsafe { instance.create_surface(&window) };
 
@@ -138,14 +151,6 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let swapchain_format = adapter.get_swap_chain_preferred_format(&surface).unwrap();
 
-    // Load the shaders from disk
-    let shader = load_shader(&device, "shader.wgsl");
-
-    let visibility_shader_set: ShaderSet =
-        vec![shader.entry("visibility_vs"), shader.entry("visibility_fs")].into();
-
-    let emit_draws_shader_set: ShaderSet = vec![shader.entry("emit_draws")].into();
-
     let size = window.inner_size();
     let mut sc_desc = wgpu::SwapChainDescriptor {
         usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
@@ -157,6 +162,34 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let mut swap_chain = device.create_swap_chain(&surface, &sc_desc);
 
+    let mut depth_desc = wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: size.width,
+            height: size.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
+    };
+
+    let depth_view_desc = wgpu::TextureViewDescriptor {
+        label: None,
+        format: Some(wgpu::TextureFormat::Depth32Float),
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        aspect: wgpu::TextureAspect::DepthOnly,
+        base_mip_level: 0,
+        mip_level_count: None,
+        base_array_layer: 0,
+        array_layer_count: None,
+    };
+
+    let mut depth_image = device.create_texture(&depth_desc);
+    let mut depth_image_view = depth_image.create_view(&depth_view_desc);
+
     let mut vertex_data = Vec::new();
     let mut index_data = Vec::new();
 
@@ -164,6 +197,23 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         .skip(1)
         .map(|path| load_mesh(path, &mut index_data, &mut vertex_data))
         .collect();
+
+    let mut camera = Camera {
+        view: Mat4::IDENTITY,
+        projection: Mat4::IDENTITY,
+    };
+
+    let mut camera_quat = Quat::IDENTITY;
+    let mut camera_pos = Vec3::new(0.0, 0.0, 10.0);
+    let mut camera_yaw = 0.0;
+    let mut camera_pitch = 0.0;
+    let mut mouse_pos = None;
+
+    let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        label: None,
+        usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+        contents: as_bytes(std::slice::from_ref(&camera)),
+    });
 
     let mesh_buffer = device.create_buffer_init(&BufferInitDescriptor {
         label: None,
@@ -219,62 +269,49 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     let num_mesh_draws = mesh_draws.len() as u32;
     drop(mesh_draws);
 
-    let mut comp_bind_group_template = emit_draws_shader_set.bind_group_template(&device, 0);
+    // Load the shaders from disk
+    let shader = load_shader(&device, "shader.wgsl");
+
+    let visibility_shader_set: ShaderSet =
+        vec![shader.entry("visibility_vs"), shader.entry("visibility_fs")].into();
+
+    let emit_draws_shader_set: ShaderSet = vec![shader.entry("emit_draws")].into();
+
+    let mut comp_bind_group_template = emit_draws_shader_set.pipeline_template(&device);
     let comp_bind_group = comp_bind_group_template
         .bind("mesh_buffer", &mesh_buffer)
         .bind("mesh_draw_buffer", &mesh_draw_buffer)
         .bind("cmd_buffer", &draw_commands_buffer)
-        .build(&device);
+        .build_bind_group(&device, 0);
 
-    let mut draw_bind_group_template = visibility_shader_set.bind_group_template(&device, 0);
+    let mut draw_bind_group_template = visibility_shader_set.pipeline_template(&device);
     let draw_bind_group = draw_bind_group_template
+        .bind("camera", &camera_buffer)
         .bind("mesh_draw_buffer", &mesh_draw_buffer)
-        .build(&device);
+        .build_bind_group(&device, 0);
 
-    let comp_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: None,
-        bind_group_layouts: &[&comp_bind_group_template.layout()],
-        push_constant_ranges: &[],
-    });
-
-    let draw_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: None,
-        bind_group_layouts: &[&draw_bind_group_template.layout()],
-        push_constant_ranges: &[],
-    });
-
-    let comp_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: None,
-        layout: Some(&comp_pipeline_layout),
-        module: &shader.module,
-        entry_point: "emit_draws",
-    });
-
-    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None,
-        layout: Some(&draw_pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader.module,
-            entry_point: "visibility_vs",
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<Vertex>() as u64,
-                step_mode: wgpu::InputStepMode::Vertex,
-                attributes: &[wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 0,
-                    shader_location: 0,
-                }],
+    let comp_pipeline = comp_bind_group_template.compute_pipeline(&device, &emit_draws_shader_set);
+    let render_pipeline = draw_bind_group_template.graphics_pipeline(
+        &device,
+        &visibility_shader_set,
+        &[wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::InputStepMode::Vertex,
+            attributes: &[wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
             }],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader.module,
-            entry_point: "visibility_fs",
-            targets: &[swapchain_format.into()],
+        }],
+        &[swapchain_format.into()],
+        Some(wgpu::DepthStencilState {
+            format: depth_desc.format,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Greater,
+            stencil: Default::default(),
+            bias: Default::default(),
         }),
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-    });
+    );
 
     let clear_color = wgpu::Color {
         r: 0.01,
@@ -284,6 +321,8 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     };
 
     let mut use_indirect_draw = true;
+
+    let mut staging_belt = wgpu::util::StagingBelt::new(0x100);
 
     // let num_timestamps = 3;
     // let timestamps = device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -304,6 +343,9 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     // let ts_period = queue.get_timestamp_period();
 
+    let mut last_frame_time = std::time::Instant::now();
+    let mut move_input = [false; 6];
+
     event_loop.run(move |evt, _, flow| match evt {
         Event::WindowEvent {
             event, window_id, ..
@@ -316,30 +358,120 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 WindowEvent::Resized(size) => {
                     sc_desc.width = size.width;
                     sc_desc.height = size.height;
+                    depth_desc.size.width = size.width;
+                    depth_desc.size.height = size.height;
+
                     swap_chain = device.create_swap_chain(&surface, &sc_desc);
+                    depth_image = device.create_texture(&depth_desc);
+                    depth_image_view = depth_image.create_view(&depth_view_desc);
                 }
                 WindowEvent::KeyboardInput { input, .. } => match input.virtual_keycode {
+                    Some(
+                        key
+                        @
+                        (winit::event::VirtualKeyCode::W
+                        | winit::event::VirtualKeyCode::S
+                        | winit::event::VirtualKeyCode::A
+                        | winit::event::VirtualKeyCode::D
+                        | winit::event::VirtualKeyCode::Q
+                        | winit::event::VirtualKeyCode::E),
+                    ) => {
+                        let key_index = match key {
+                            winit::event::VirtualKeyCode::W => 0,
+                            winit::event::VirtualKeyCode::S => 1,
+                            winit::event::VirtualKeyCode::D => 2,
+                            winit::event::VirtualKeyCode::A => 3,
+                            winit::event::VirtualKeyCode::Q => 4,
+                            winit::event::VirtualKeyCode::E => 5,
+                            _ => unreachable!(),
+                        };
+
+                        move_input[key_index] = match input.state {
+                            winit::event::ElementState::Pressed => true,
+                            winit::event::ElementState::Released => false,
+                        };
+                    }
+
                     Some(winit::event::VirtualKeyCode::I) => {
                         use_indirect_draw = !use_indirect_draw;
                     }
                     _ => {}
                 },
+                WindowEvent::CursorMoved { position, .. } => {
+                    let old_pos = match mouse_pos.replace(position) {
+                        Some(pos) => pos,
+                        None => return,
+                    };
+                    let delta_x = position.x - old_pos.x;
+                    let delta_y = position.y - old_pos.y;
+                    camera_yaw -= (delta_x * 0.002) as f32;
+                    camera_pitch = (camera_pitch + (-delta_y * 0.002) as f32).clamp(-PI, PI);
+                    camera_quat =
+                        Quat::from_euler(glam::EulerRot::YXZ, camera_yaw, camera_pitch, 0.0);
+                }
                 _ => {}
             }
         }
         Event::MainEventsCleared => {
-            // device.poll(wgpu::Maintain::Poll);
             window.request_redraw();
+        }
+        Event::RedrawEventsCleared => {
+            device.poll(wgpu::Maintain::Poll);
+            spawner.run_until_stalled();
         }
         Event::RedrawRequested(window_id) if window_id == window.id() => {
             let frame = swap_chain
                 .get_current_frame()
                 .expect("Failed to acquire next swap chain texture")
                 .output;
+
+            let cpu_time_start = std::time::Instant::now();
+
+            let delta_time = cpu_time_start.duration_since(last_frame_time);
+            last_frame_time = cpu_time_start;
+
+            let move_input_vec: Vec3 = move_input
+                .iter()
+                .enumerate()
+                .map(|(i, active)| match (i, active) {
+                    (0, true) => -Vec3::Z,
+                    (1, true) => Vec3::Z,
+                    (2, true) => Vec3::X,
+                    (3, true) => -Vec3::X,
+                    (4, true) => -Vec3::Y,
+                    (5, true) => Vec3::Y,
+                    _ => Vec3::ZERO,
+                })
+                .fold(Vec3::ZERO, |a, b| a + b);
+
+            camera_pos += camera_quat * (move_input_vec * 5.0 * delta_time.as_secs_f32());
+            camera.view =
+                Mat4::from_scale_rotation_translation(Vec3::splat(1.0), camera_quat, camera_pos)
+                    .inverse();
+            camera.projection = Mat4::perspective_infinite_reverse_rh(
+                1.3,
+                window.inner_size().width as f32 / window.inner_size().height as f32,
+                0.1,
+            );
+            dbg!(&camera_pos);
+
             let mut encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-            let cpu_time_start = std::time::Instant::now();
+            // update camera uniform
+            staging_belt
+                .write_buffer(
+                    &mut encoder,
+                    &camera_buffer,
+                    0,
+                    wgpu::BufferSize::new(std::mem::size_of::<Camera>() as wgpu::BufferAddress)
+                        .unwrap(),
+                    &device,
+                )
+                .copy_from_slice(as_bytes(std::slice::from_ref(&camera)));
+
+            staging_belt.finish();
+            // encode passes
             // encoder.write_timestamp(&timestamps, 0);
             {
                 let mut comp_pass =
@@ -362,7 +494,14 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                             store: true,
                         },
                     }],
-                    depth_stencil_attachment: None,
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_image_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: true,
+                        }),
+                        stencil_ops: None,
+                    }),
                 });
                 render_pass.set_pipeline(&render_pipeline);
                 render_pass.set_bind_group(0, &draw_bind_group, &[]);
@@ -376,6 +515,8 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
             // encoder.resolve_query_set(&timestamps, 0..num_timestamps, timestamp_buffer, 0);
             queue.submit(Some(encoder.finish()));
             drop(frame);
+
+            spawner.spawn_local(staging_belt.recall());
 
             let cpu_time = cpu_time_start.elapsed();
 
@@ -428,7 +569,6 @@ impl Display for DisplayTime {
 
 fn main() {
     tracing_subscriber::fmt::init();
-
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("dovetail")
