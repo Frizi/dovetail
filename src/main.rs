@@ -11,6 +11,7 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
+mod pp;
 mod shader;
 mod tasks;
 mod util;
@@ -57,7 +58,6 @@ fn load_mesh(
 
     vertex_buffer.extend_from_slice(&model.vertices);
     index_buffer.extend_from_slice(&opt_indices);
-    // index_buffer.extend(opt_indices.iter().map(|i| i + index_base));
 
     let mut simplified_indices = Vec::new();
 

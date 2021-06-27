@@ -539,7 +539,8 @@ impl<'a> ShaderEntryPoint<'a> {
 pub fn load_shader(device: &wgpu::Device, filename: impl AsRef<Path>) -> Shader {
     let filename_string = filename.as_ref().as_os_str().to_string_lossy().into_owned();
     let path = Path::new("shaders").join(filename);
-    let shader_src = std::fs::read_to_string(path).expect("failed to read shader file");
+    let shader_src =
+        crate::pp::load_shader_preprocessed(&path).expect("failed to read shader file");
 
     let naga_module = naga::front::wgsl::parse_str(&shader_src).unwrap();
     let mut validator = naga::valid::Validator::new(
