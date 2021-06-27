@@ -102,11 +102,13 @@ fn hash_rgb(x: u32) -> vec3<f32> {
 struct VertexOutput {
     [[builtin(position)]] position: vec4<f32>;
     [[location(1), interpolate(flat)]] instance_index: u32;
+    [[location(2), interpolate(flat)]] vertex_index: u32;
 };
 
 [[stage(vertex)]]
 fn visibility_vs(
     [[builtin(instance_index)]] instance_index: u32,
+    [[builtin(vertex_index)]] vertex_index: u32,
     [[location(0)]] position: vec3<f32>,
 ) -> VertexOutput {
     let mesh_draw = mesh_draw_buffer.mesh_draws[instance_index];
@@ -116,11 +118,13 @@ fn visibility_vs(
     return VertexOutput(
         camera.projection * camera.view * vec4<f32>(pos, 1.0),
         instance_index,
+        vertex_index,
     );
 }
 
 [[stage(fragment)]]
 fn visibility_fs(input: VertexOutput) -> [[location(0)]] vec4<f32> {
-    let rgb = hash_rgb(input.instance_index);
-    return vec4<f32>(rgb, 1.0);
+    let rgb1 = hash_rgb(input.instance_index);
+    let rgb2 = hash_rgb(input.vertex_index);
+    return vec4<f32>(rgb1 * 0.7 + rgb2 * 0.3, 1.0);
 }

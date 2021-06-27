@@ -18,3 +18,4 @@ bytemuck = "1.7.0"
 memoffset = "0.6.4"
 naga = { version = "0.5.0", features = ["wgsl-in"] }
 async-executor = "1.4.1"
+rand = { version = "0.8.4", features = ["small_rng"] }

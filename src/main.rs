@@ -1,10 +1,12 @@
 use std::{f32::consts::PI, fmt::Display, path::Path};
 
 use glam::{Mat4, Quat, Vec3, Vec4};
+use rand::{Rng, SeedableRng};
 use tasks::Spawner;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::{
-    event::{Event, WindowEvent},
+    dpi::PhysicalPosition,
+    event::{ElementState, Event, ModifiersState, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
@@ -237,19 +239,23 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let mut mesh_draws: Vec<MeshDraw> = Vec::new();
 
-    for i in 0..32 {
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(42424242);
+
+    for i in 0..1024 {
+        let mesh_index = i % meshes.len();
+        let bound = meshes[mesh_index].bound_sphere;
         mesh_draws.push(MeshDraw {
             position_scale: Vec4::new(
-                0.5 * (i as f32 * 142.33).sin(),
-                0.5 * (i as f32 * 27.43).cos(),
-                0.0,
-                0.5 + 0.3 * (i as f32 * 1234.77).sin(),
+                rng.gen_range(-100.0..=100.0) - bound.x,
+                rng.gen_range(-100.0..=100.0) - bound.y,
+                rng.gen_range(-100.0..=100.0) - bound.z,
+                rng.gen_range(4.0..10.0) / bound.w,
             ),
             orientation: Quat::from_axis_angle(
-                Vec3::new(1.0, 0.0, 1.0).normalize(),
-                i as f32 * 12.763,
+                Vec3::new(rng.gen(), rng.gen(), rng.gen()).normalize(),
+                rng.gen_range(0.0..PI * 2.0),
             ),
-            mesh_index: i % meshes.len() as u32,
+            mesh_index: mesh_index as u32,
         });
     }
 
@@ -345,7 +351,8 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let mut last_frame_time = std::time::Instant::now();
     let mut move_input = [false; 6];
-
+    let mut cursor_grabbed = false;
+    let mut modifiers = ModifiersState::empty();
     event_loop.run(move |evt, _, flow| match evt {
         Event::WindowEvent {
             event, window_id, ..
@@ -364,6 +371,9 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                     swap_chain = device.create_swap_chain(&surface, &sc_desc);
                     depth_image = device.create_texture(&depth_desc);
                     depth_image_view = depth_image.create_view(&depth_view_desc);
+                }
+                WindowEvent::ModifiersChanged(state) => {
+                    modifiers = state;
                 }
                 WindowEvent::KeyboardInput { input, .. } => match input.virtual_keycode {
                     Some(
@@ -387,13 +397,22 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                         };
 
                         move_input[key_index] = match input.state {
-                            winit::event::ElementState::Pressed => true,
-                            winit::event::ElementState::Released => false,
+                            ElementState::Pressed => true,
+                            ElementState::Released => false,
                         };
                     }
 
-                    Some(winit::event::VirtualKeyCode::I) => {
+                    Some(winit::event::VirtualKeyCode::I)
+                        if input.state == ElementState::Pressed =>
+                    {
                         use_indirect_draw = !use_indirect_draw;
+                    }
+                    Some(winit::event::VirtualKeyCode::G)
+                        if input.state == ElementState::Pressed =>
+                    {
+                        cursor_grabbed = !cursor_grabbed;
+                        let _ = window.set_cursor_grab(cursor_grabbed);
+                        window.set_cursor_visible(!cursor_grabbed);
                     }
                     _ => {}
                 },
@@ -408,6 +427,20 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                     camera_pitch = (camera_pitch + (-delta_y * 0.002) as f32).clamp(-PI, PI);
                     camera_quat =
                         Quat::from_euler(glam::EulerRot::YXZ, camera_yaw, camera_pitch, 0.0);
+
+                    if cursor_grabbed {
+                        let size = window.inner_size();
+                        let center = PhysicalPosition {
+                            x: size.width / 2,
+                            y: size.height / 2,
+                        };
+                        if window.set_cursor_position(center).is_ok() {
+                            mouse_pos.replace(PhysicalPosition {
+                                x: center.x as f64,
+                                y: center.y as f64,
+                            });
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -444,7 +477,12 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 })
                 .fold(Vec3::ZERO, |a, b| a + b);
 
-            camera_pos += camera_quat * (move_input_vec * 5.0 * delta_time.as_secs_f32());
+            let move_speed = match modifiers.contains(ModifiersState::SHIFT) {
+                true => 25.0,
+                false => 10.0,
+            };
+
+            camera_pos += camera_quat * (move_input_vec * move_speed * delta_time.as_secs_f32());
             camera.view =
                 Mat4::from_scale_rotation_translation(Vec3::splat(1.0), camera_quat, camera_pos)
                     .inverse();
@@ -453,7 +491,6 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 window.inner_size().width as f32 / window.inner_size().height as f32,
                 0.1,
             );
-            dbg!(&camera_pos);
 
             let mut encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
