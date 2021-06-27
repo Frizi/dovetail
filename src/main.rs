@@ -5,7 +5,7 @@ use rand::{Rng, SeedableRng};
 use tasks::Spawner;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::{
-    dpi::PhysicalPosition,
+    dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, Event, ModifiersState, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
@@ -59,24 +59,29 @@ fn load_mesh(
     index_buffer.extend_from_slice(&opt_indices);
     // index_buffer.extend(opt_indices.iter().map(|i| i + index_base));
 
-    let mut indices_target = opt_indices.len() * 3 / 4;
     let mut simplified_indices = Vec::new();
 
+    let mut max_lod: u32 = levels.len() as u32 - 1;
     for level in 1..8 {
         let indices = match level {
             1 => &opt_indices[..],
             _ => &simplified_indices[..],
         };
 
+        let last_indices_len = indices.len();
+        let indices_target = last_indices_len * 3 / 4;
         simplified_indices = meshopt::simplify(indices, &adapter, indices_target, 1e-2);
+        if simplified_indices.len() >= last_indices_len {
+            max_lod = level - 1;
+            break;
+        }
         meshopt::optimize_vertex_cache_in_place(&simplified_indices, model.vertices.len());
 
-        indices_target = simplified_indices.len() * 3 / 4;
         let index_offset = index_buffer.len() as u32;
         let index_count = simplified_indices.len() as u32;
         index_buffer.extend_from_slice(&simplified_indices);
 
-        levels[level] = MeshLod {
+        levels[level as usize] = MeshLod {
             index_count,
             index_offset,
         };
@@ -86,6 +91,7 @@ fn load_mesh(
         bound_sphere,
         vertex_offset,
         vertex_count,
+        max_lod,
         levels,
     }
 }
@@ -106,6 +112,7 @@ struct Mesh {
     bound_sphere: Vec4,
     vertex_offset: u32,
     vertex_count: u32,
+    max_lod: u32,
     levels: [MeshLod; 8],
 }
 
@@ -121,10 +128,19 @@ struct Camera {
     view_proj: Mat4,
     // only cull 4 side planes
     frustum: [Vec4; 4],
+    position: Vec3,
 }
 
 impl Camera {
-    fn from_view_proj(view: Mat4, projection: Mat4) -> Self {
+    fn new(pos: Vec3, orientation: Quat, window_size: PhysicalSize<u32>) -> Self {
+        let view =
+            Mat4::from_scale_rotation_translation(Vec3::splat(1.0), orientation, pos).inverse();
+        let projection = Mat4::perspective_infinite_reverse_rh(
+            1.3,
+            window_size.width as f32 / window_size.height as f32,
+            0.1,
+        );
+
         let view_proj = projection * view;
 
         Self {
@@ -138,6 +154,7 @@ impl Camera {
                 normalize_plane(view_proj.row(3) - view_proj.row(1)),
                 // normalize_plane(view_proj.row(3) - view_proj.row(2)),
             ],
+            position: pos,
         }
     }
 }
@@ -507,15 +524,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
             };
 
             camera_pos += camera_quat * (move_input_vec * move_speed * delta_time.as_secs_f32());
-            let view =
-                Mat4::from_scale_rotation_translation(Vec3::splat(1.0), camera_quat, camera_pos)
-                    .inverse();
-            let projection = Mat4::perspective_infinite_reverse_rh(
-                1.3,
-                window.inner_size().width as f32 / window.inner_size().height as f32,
-                0.1,
-            );
-            let camera = Camera::from_view_proj(view, projection);
+            let camera = Camera::new(camera_pos, camera_quat, window.inner_size());
 
             let mut encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });

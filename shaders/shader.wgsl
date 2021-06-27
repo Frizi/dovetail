@@ -13,6 +13,7 @@ struct Mesh {
     bound_sphere: vec4<f32>;
     vertex_offset: u32;
     vertex_count: u32;
+    max_lod: u32;
     levels: array<MeshLod, 8>;
 };
 
@@ -50,6 +51,7 @@ struct Camera {
     projection: mat4x4<f32>;
     view_proj: mat4x4<f32>;
     frustum: array<vec4<f32>, 4>;
+    position: vec3<f32>;
 };
 
 [[group(0), binding(0)]]
@@ -68,13 +70,12 @@ fn emit_draws(
     let draw = mesh_draw_buffer.mesh_draws[global_id.x];
     let mesh_index = draw.mesh_index;
     let mesh = mesh_buffer.meshes[mesh_index];
-    // TODO: select lod
-    let lod = mesh.levels[0];
-
-	let center = rotate_quat(mesh.bound_sphere.xyz, draw.orientation) * draw.position_scale.w + draw.position_scale.xyz;
-	let radius = mesh.bound_sphere.w * draw.position_scale.w;
 
     var visible: bool = true;
+
+    // frustum culling
+	let center = rotate_quat(mesh.bound_sphere.xyz, draw.orientation) * draw.position_scale.w + draw.position_scale.xyz;
+	let radius = mesh.bound_sphere.w * draw.position_scale.w;
 	for (var i: i32 = 0; i < 4; i = i + 1) {
 		visible = visible && dot(camera.frustum[i], vec4<f32>(center, 1.0)) > -radius;
     }
@@ -83,6 +84,15 @@ fn emit_draws(
     if (visible) {
         visible_u = 1u;
     }
+
+    // select lod level
+    let eye_pos = camera.position;
+    let lod_base = 14.0;
+    let lod_step = 1.5;
+    let lod_select = log2(distance(center, eye_pos) / lod_base) / log2(lod_step);
+    let lod_index = min(u32(max(lod_select + 1.0, 0.0)), mesh.max_lod);
+    let lod = mesh_buffer.meshes[mesh_index].levels[lod_index];
+
     cmd_buffer.commands[global_id.x] = DrawCmd(
         lod.index_count,
         visible_u,
