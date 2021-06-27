@@ -1,6 +1,6 @@
 use std::{f32::consts::PI, fmt::Display, path::Path};
 
-use glam::{Mat4, Quat, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec3, Vec4, Vec4Swizzles};
 use rand::{Rng, SeedableRng};
 use tasks::Spawner;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
@@ -109,11 +109,37 @@ struct Mesh {
     levels: [MeshLod; 8],
 }
 
+fn normalize_plane(plane: Vec4) -> Vec4 {
+    plane / plane.xyz().length()
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Camera {
     view: Mat4,
     projection: Mat4,
+    view_proj: Mat4,
+    // only cull 4 side planes
+    frustum: [Vec4; 4],
+}
+
+impl Camera {
+    fn from_view_proj(view: Mat4, projection: Mat4) -> Self {
+        let view_proj = projection * view;
+
+        Self {
+            view,
+            projection,
+            view_proj: view_proj,
+            frustum: [
+                normalize_plane(view_proj.row(3) + view_proj.row(0)),
+                normalize_plane(view_proj.row(3) - view_proj.row(0)),
+                normalize_plane(view_proj.row(3) + view_proj.row(1)),
+                normalize_plane(view_proj.row(3) - view_proj.row(1)),
+                // normalize_plane(view_proj.row(3) - view_proj.row(2)),
+            ],
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -189,8 +215,8 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         array_layer_count: None,
     };
 
-    let mut depth_image = device.create_texture(&depth_desc);
-    let mut depth_image_view = depth_image.create_view(&depth_view_desc);
+    let mut _depth_image = device.create_texture(&depth_desc);
+    let mut depth_image_view = _depth_image.create_view(&depth_view_desc);
 
     let mut vertex_data = Vec::new();
     let mut index_data = Vec::new();
@@ -200,21 +226,17 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         .map(|path| load_mesh(path, &mut index_data, &mut vertex_data))
         .collect();
 
-    let mut camera = Camera {
-        view: Mat4::IDENTITY,
-        projection: Mat4::IDENTITY,
-    };
-
     let mut camera_quat = Quat::IDENTITY;
     let mut camera_pos = Vec3::new(0.0, 0.0, 10.0);
     let mut camera_yaw = 0.0;
     let mut camera_pitch = 0.0;
     let mut mouse_pos = None;
 
-    let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
+    let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
-        contents: as_bytes(std::slice::from_ref(&camera)),
+        size: std::mem::size_of::<Camera>() as u64,
+        mapped_at_creation: false,
     });
 
     let mesh_buffer = device.create_buffer_init(&BufferInitDescriptor {
@@ -246,9 +268,9 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         let bound = meshes[mesh_index].bound_sphere;
         mesh_draws.push(MeshDraw {
             position_scale: Vec4::new(
-                rng.gen_range(-100.0..=100.0) - bound.x,
-                rng.gen_range(-100.0..=100.0) - bound.y,
-                rng.gen_range(-100.0..=100.0) - bound.z,
+                rng.gen_range(-100.0..=100.0) - bound.x / bound.w,
+                rng.gen_range(-100.0..=100.0) - bound.y / bound.w,
+                rng.gen_range(-100.0..=100.0) - bound.z / bound.w,
                 rng.gen_range(4.0..10.0) / bound.w,
             ),
             orientation: Quat::from_axis_angle(
@@ -285,6 +307,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let mut comp_bind_group_template = emit_draws_shader_set.pipeline_template(&device);
     let comp_bind_group = comp_bind_group_template
+        .bind("camera", &camera_buffer)
         .bind("mesh_buffer", &mesh_buffer)
         .bind("mesh_draw_buffer", &mesh_draw_buffer)
         .bind("cmd_buffer", &draw_commands_buffer)
@@ -369,8 +392,8 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                     depth_desc.size.height = size.height;
 
                     swap_chain = device.create_swap_chain(&surface, &sc_desc);
-                    depth_image = device.create_texture(&depth_desc);
-                    depth_image_view = depth_image.create_view(&depth_view_desc);
+                    _depth_image = device.create_texture(&depth_desc);
+                    depth_image_view = _depth_image.create_view(&depth_view_desc);
                 }
                 WindowEvent::ModifiersChanged(state) => {
                     modifiers = state;
@@ -424,7 +447,8 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                     let delta_x = position.x - old_pos.x;
                     let delta_y = position.y - old_pos.y;
                     camera_yaw -= (delta_x * 0.002) as f32;
-                    camera_pitch = (camera_pitch + (-delta_y * 0.002) as f32).clamp(-PI, PI);
+                    camera_pitch =
+                        (camera_pitch + (-delta_y * 0.002) as f32).clamp(-PI / 2., PI / 2.);
                     camera_quat =
                         Quat::from_euler(glam::EulerRot::YXZ, camera_yaw, camera_pitch, 0.0);
 
@@ -483,14 +507,15 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
             };
 
             camera_pos += camera_quat * (move_input_vec * move_speed * delta_time.as_secs_f32());
-            camera.view =
+            let view =
                 Mat4::from_scale_rotation_translation(Vec3::splat(1.0), camera_quat, camera_pos)
                     .inverse();
-            camera.projection = Mat4::perspective_infinite_reverse_rh(
+            let projection = Mat4::perspective_infinite_reverse_rh(
                 1.3,
                 window.inner_size().width as f32 / window.inner_size().height as f32,
                 0.1,
             );
+            let camera = Camera::from_view_proj(view, projection);
 
             let mut encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });

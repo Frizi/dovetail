@@ -48,6 +48,8 @@ struct CmdBuffer {
 struct Camera {
     view: mat4x4<f32>;
     projection: mat4x4<f32>;
+    view_proj: mat4x4<f32>;
+    frustum: array<vec4<f32>, 4>;
 };
 
 [[group(0), binding(0)]]
@@ -63,14 +65,27 @@ var<storage> cmd_buffer: [[access(write)]] CmdBuffer;
 fn emit_draws(
     [[builtin(global_invocation_id)]] global_id: vec3<u32>,
 ) {
-    let mesh_index = mesh_draw_buffer.mesh_draws[global_id.x].mesh_index;
-    // TODO: cull and select lod
+    let draw = mesh_draw_buffer.mesh_draws[global_id.x];
+    let mesh_index = draw.mesh_index;
     let mesh = mesh_buffer.meshes[mesh_index];
+    // TODO: select lod
     let lod = mesh.levels[0];
-    
+
+	let center = rotate_quat(mesh.bound_sphere.xyz, draw.orientation) * draw.position_scale.w + draw.position_scale.xyz;
+	let radius = mesh.bound_sphere.w * draw.position_scale.w;
+
+    var visible: bool = true;
+	for (var i: i32 = 0; i < 4; i = i + 1) {
+		visible = visible && dot(camera.frustum[i], vec4<f32>(center, 1.0)) > -radius;
+    }
+
+    var visible_u: u32 = 0u;
+    if (visible) {
+        visible_u = 1u;
+    }
     cmd_buffer.commands[global_id.x] = DrawCmd(
         lod.index_count,
-        1u,
+        visible_u,
         lod.index_offset,
         mesh.vertex_offset,
         global_id.x,
@@ -116,7 +131,7 @@ fn visibility_vs(
     pos = rotate_quat(pos * mesh_draw.position_scale.w, mesh_draw.orientation) + mesh_draw.position_scale.xyz;
     // pos = vec3<f32>(pos.xy * 0.05, pos.z * 0.01 + 0.1);
     return VertexOutput(
-        camera.projection * camera.view * vec4<f32>(pos, 1.0),
+        camera.view_proj * vec4<f32>(pos, 1.0),
         instance_index,
         vertex_index,
     );
