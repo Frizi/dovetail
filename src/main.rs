@@ -186,7 +186,9 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                features: wgpu::Features::MULTI_DRAW_INDIRECT | wgpu::Features::TIMESTAMP_QUERY,
+                features: wgpu::Features::MULTI_DRAW_INDIRECT
+                    | wgpu::Features::TIMESTAMP_QUERY
+                    | wgpu::Features::PIPELINE_STATISTICS_QUERY,
                 limits: wgpu::Limits::default(),
             },
             None,
@@ -280,7 +282,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(42424242);
 
-    for i in 0..1024 {
+    for i in 0..2048 {
         let mesh_index = i % meshes.len();
         let bound = meshes[mesh_index].bound_sphere;
         mesh_draws.push(MeshDraw {
@@ -370,24 +372,31 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let mut staging_belt = wgpu::util::StagingBelt::new(0x100);
 
-    // let num_timestamps = 3;
-    // let timestamps = device.create_query_set(&wgpu::QuerySetDescriptor {
-    //     ty: wgpu::QueryType::Timestamp,
-    //     count: num_timestamps,
-    // });
+    let num_timestamps = 3;
+    let timestamps_query = device.create_query_set(&wgpu::QuerySetDescriptor {
+        ty: wgpu::QueryType::Timestamp,
+        count: num_timestamps,
+    });
 
-    // let timestamp_buffers = (0..4)
-    //     .map(|_| {
-    //         device.create_buffer(&wgpu::BufferDescriptor {
-    //             label: None,
-    //             usage: wgpu::BufferUsage::COPY_DST | wgpu::BufferUsage::MAP_READ,
-    //             size: num_timestamps as u64 * std::mem::size_of::<u64>() as u64,
-    //             mapped_at_creation: false,
-    //         })
-    //     })
-    //     .collect::<Vec<_>>();
+    let num_statistics = 3;
+    let statistics_query = device.create_query_set(&wgpu::QuerySetDescriptor {
+        ty: wgpu::QueryType::PipelineStatistics(
+            wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
+                | wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
+                | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+        ),
+        count: num_timestamps,
+    });
 
-    // let ts_period = queue.get_timestamp_period();
+    let timestamp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        usage: wgpu::BufferUsage::COPY_DST | wgpu::BufferUsage::MAP_READ,
+        size: num_timestamps as u64 * std::mem::size_of::<u64>() as u64
+            + num_statistics as u64 * std::mem::size_of::<u64>() as u64,
+        mapped_at_creation: false,
+    });
+
+    let ts_period = queue.get_timestamp_period();
 
     let mut last_frame_time = std::time::Instant::now();
     let mut move_input = [false; 6];
@@ -494,10 +503,13 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
             spawner.run_until_stalled();
         }
         Event::RedrawRequested(window_id) if window_id == window.id() => {
-            let frame = swap_chain
-                .get_current_frame()
-                .expect("Failed to acquire next swap chain texture")
-                .output;
+            let frame = match swap_chain.get_current_frame() {
+                Ok(frame) => frame.output,
+                Err(err) => {
+                    eprintln!("Failed to acquire next swapchain frame: {}", err);
+                    return;
+                }
+            };
 
             let cpu_time_start = std::time::Instant::now();
 
@@ -543,7 +555,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
             staging_belt.finish();
             // encode passes
-            // encoder.write_timestamp(&timestamps, 0);
+            encoder.write_timestamp(&timestamps_query, 0);
             {
                 let mut comp_pass =
                     encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
@@ -552,7 +564,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 comp_pass.dispatch((num_mesh_draws + 31) / 32, 1, 1);
             }
 
-            // encoder.write_timestamp(&timestamps, 1);
+            encoder.write_timestamp(&timestamps_query, 1);
 
             {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -578,12 +590,18 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 render_pass.set_bind_group(0, &draw_bind_group, &[]);
                 render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.begin_pipeline_statistics_query(&statistics_query, 0);
                 render_pass.multi_draw_indexed_indirect(&draw_commands_buffer, 0, num_mesh_draws);
+                render_pass.end_pipeline_statistics_query();
             }
-
-            // encoder.write_timestamp(&timestamps, 1);
-
-            // encoder.resolve_query_set(&timestamps, 0..num_timestamps, timestamp_buffer, 0);
+            encoder.write_timestamp(&timestamps_query, 2);
+            encoder.resolve_query_set(&timestamps_query, 0..num_timestamps, &timestamp_buffer, 0);
+            encoder.resolve_query_set(
+                &statistics_query,
+                0..1,
+                &timestamp_buffer,
+                num_timestamps as u64 * std::mem::size_of::<u64>() as u64,
+            );
             queue.submit(Some(encoder.finish()));
             drop(frame);
 
@@ -591,23 +609,39 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
             let cpu_time = cpu_time_start.elapsed();
 
-            // let buf_slice = timestamp_buffer.slice(..);
-            // let _ = buf_slice.map_async(wgpu::MapMode::Read);
-            // device.poll(wgpu::Maintain::Poll);
-            // let timestamps = buf_slice.get_mapped_range();
-            // let gpu_time_compute = (timestamps[1] - timestamps[0]) as f64 * ts_period as f64;
-            // let gpu_time_draw = (timestamps[2] - timestamps[1]) as f64 * ts_period as f64;
-            // let gpu_time_total = (timestamps[2] - timestamps[0]) as f64 * ts_period as f64;
-            // drop(timestamps);
-            // timestamp_buffer.unmap();
+            let buf_slice = timestamp_buffer.slice(..);
+            let _ = buf_slice.map_async(wgpu::MapMode::Read);
+            device.poll(wgpu::Maintain::Wait);
+            let stats = buf_slice.get_mapped_range();
+            let stats_bytes = &stats[..];
+            let stats_u64 = unsafe {
+                std::slice::from_raw_parts(
+                    stats_bytes.as_ptr() as *const u64,
+                    stats_bytes.len() * 8,
+                )
+            };
+
+            let gpu_time_compute = (stats_u64[1] - stats_u64[0]) as f64 * ts_period as f64;
+            let gpu_time_draw = (stats_u64[2] - stats_u64[1]) as f64 * ts_period as f64;
+            let gpu_time_total = (stats_u64[2] - stats_u64[0]) as f64 * ts_period as f64;
+
+            let num_vertices = stats_u64[num_timestamps as usize + 0];
+            let num_triangles = stats_u64[num_timestamps as usize + 1];
+            let num_fragments = stats_u64[num_timestamps as usize + 2];
+
+            drop(stats);
+            timestamp_buffer.unmap();
 
             let title = format!(
-                "dovetail :: CPU time: {}, indirect = {:?}",
-                // DisplayTime::from_ns(gpu_time_total),
-                // DisplayTime::from_ns(gpu_time_compute),
-                // DisplayTime::from_ns(gpu_time_draw),
+                "dovetail :: GPU: {} comp: {} draw: {} | CPU: {} | {}t {}v {}f",
+                DisplayTime::from_ns(gpu_time_total),
+                DisplayTime::from_ns(gpu_time_compute),
+                DisplayTime::from_ns(gpu_time_draw),
                 DisplayTime(cpu_time),
-                use_indirect_draw
+                num_triangles,
+                num_vertices,
+                num_fragments,
+                // use_indirect_draw
             );
             window.set_title(&title);
             *flow = ControlFlow::Poll;
@@ -617,17 +651,17 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 }
 
 struct DisplayTime(std::time::Duration);
-// impl DisplayTime {
-//     fn from_ns(nanos: f64) -> Self {
-//         Self(std::time::Duration::from_nanos(nanos as u64))
-//     }
-// }
+impl DisplayTime {
+    fn from_ns(nanos: f64) -> Self {
+        Self(std::time::Duration::from_nanos(nanos as u64))
+    }
+}
 
 impl Display for DisplayTime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let d = self.0;
         if d.as_secs() >= 1 {
-            write!(f, "{:.2}s", d.as_millis() as f32 / 1000.0)
+            write!(f, "{:.2}s ", d.as_millis() as f32 / 1000.0)
         } else if d.as_millis() >= 1 {
             write!(f, "{:.2}ms", d.as_micros() as f32 / 1000.0)
         } else if d.as_micros() >= 1 {

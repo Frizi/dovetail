@@ -139,7 +139,6 @@ fn visibility_vs(
     let mesh_draw = mesh_draw_buffer.mesh_draws[instance_index];
     var pos: vec3<f32> = position;
     pos = rotate_quat(pos * mesh_draw.position_scale.w, mesh_draw.orientation) + mesh_draw.position_scale.xyz;
-    // pos = vec3<f32>(pos.xy * 0.05, pos.z * 0.01 + 0.1);
     return VertexOutput(
         camera.view_proj * vec4<f32>(pos, 1.0),
         instance_index,
@@ -151,5 +150,6 @@ fn visibility_vs(
 fn visibility_fs(input: VertexOutput) -> [[location(0)]] vec4<f32> {
     let rgb1 = hash_rgb(input.instance_index);
     let rgb2 = hash_rgb(input.vertex_index);
-    return vec4<f32>(rgb1 * 0.7 + rgb2 * 0.3, 1.0);
+    let rgb = mix(rgb1, rgb2, vec3<f32>(0.3));
+    return vec4<f32>(rgb, 1.0);
 }
