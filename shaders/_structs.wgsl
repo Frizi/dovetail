@@ -41,10 +41,21 @@ struct CmdBuffer {
 };
 
 [[block]]
+struct VisBuffer {
+    vis: array<u32>;
+};
+
+[[block]]
 struct Camera {
     view: mat4x4<f32>;
     projection: mat4x4<f32>;
     view_proj: mat4x4<f32>;
     frustum: array<vec4<f32>, 4>;
     position: vec3<f32>;
+};
+
+[[block]]
+struct PyramidInfo {
+    width: u32;
+    height: u32;
 };

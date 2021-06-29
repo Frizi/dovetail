@@ -1,4 +1,4 @@
-use std::{f32::consts::PI, fmt::Display, path::Path};
+use std::{f32::consts::PI, fmt::Display, num::NonZeroU32, path::Path};
 
 use glam::{Mat4, Quat, Vec3, Vec4, Vec4Swizzles};
 use rand::{Rng, SeedableRng};
@@ -116,6 +116,14 @@ struct Mesh {
     levels: [MeshLod; 8],
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct MeshLod {
+    index_offset: u32,
+    index_count: u32,
+}
+
 fn normalize_plane(plane: Vec4) -> Vec4 {
     plane / plane.xyz().length()
 }
@@ -159,12 +167,11 @@ impl Camera {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct MeshLod {
-    index_offset: u32,
-    index_count: u32,
+struct PyramidInfo {
+    width: u32,
+    height: u32,
 }
 
 async fn run(event_loop: EventLoop<()>, window: Window) {
@@ -187,17 +194,24 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
             &wgpu::DeviceDescriptor {
                 label: None,
                 features: wgpu::Features::MULTI_DRAW_INDIRECT
+                    | wgpu::Features::PUSH_CONSTANTS
                     | wgpu::Features::TIMESTAMP_QUERY
                     | wgpu::Features::PIPELINE_STATISTICS_QUERY,
-                limits: wgpu::Limits::default(),
+                limits: wgpu::Limits {
+                    max_push_constant_size: 4,
+                    ..wgpu::Limits::default()
+                },
             },
             None,
         )
         .await
         .expect("Failed to create device");
 
-    let swapchain_format = adapter.get_swap_chain_preferred_format(&surface).unwrap();
+    // Load the shaders from disk
+    let shader = load_shader(&device, "shader.wgsl");
+    let reduce_shader = load_shader(&device, "depth_reduce.wgsl");
 
+    let swapchain_format = adapter.get_swap_chain_preferred_format(&surface).unwrap();
     let size = window.inner_size();
     let mut sc_desc = wgpu::SwapChainDescriptor {
         usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
@@ -220,7 +234,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsage::RENDER_ATTACHMENT | wgpu::TextureUsage::SAMPLED,
     };
 
     let depth_view_desc = wgpu::TextureViewDescriptor {
@@ -232,6 +246,12 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         mip_level_count: None,
         base_array_layer: 0,
         array_layer_count: None,
+    };
+
+    let pyramid_view_desc = wgpu::TextureViewDescriptor {
+        format: Some(wgpu::TextureFormat::R32Float),
+        aspect: wgpu::TextureAspect::All,
+        ..depth_view_desc
     };
 
     let mut _depth_image = device.create_texture(&depth_desc);
@@ -258,21 +278,32 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         mapped_at_creation: false,
     });
 
+    let mut pyramid_info = PyramidInfo {
+        width: size.width,
+        height: size.height,
+    };
+
+    let pyramid_info_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("pyramid_info_buffer"),
+        usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+        contents: ref_as_bytes(&pyramid_info),
+    });
+
     let mesh_buffer = device.create_buffer_init(&BufferInitDescriptor {
-        label: None,
+        label: Some("mesh_buffer"),
         usage: wgpu::BufferUsage::STORAGE,
         contents: as_bytes(&meshes),
     });
 
     let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
-        label: None,
+        label: Some("index_buffer"),
         usage: wgpu::BufferUsage::INDEX,
         contents: as_bytes(&index_data),
     });
     drop(index_data);
 
     let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
-        label: None,
+        label: Some("vertex_buffer"),
         usage: wgpu::BufferUsage::VERTEX,
         contents: as_bytes(&vertex_data),
     });
@@ -282,7 +313,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(42424242);
 
-    for i in 0..2048 {
+    for i in 0..1024 * 64 {
         let mesh_index = i % meshes.len();
         let bound = meshes[mesh_index].bound_sphere;
         mesh_draws.push(MeshDraw {
@@ -290,7 +321,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 rng.gen_range(-100.0..=100.0) - bound.x / bound.w,
                 rng.gen_range(-100.0..=100.0) - bound.y / bound.w,
                 rng.gen_range(-100.0..=100.0) - bound.z / bound.w,
-                rng.gen_range(4.0..10.0) / bound.w,
+                rng.gen_range(10.0..30.0) / bound.w,
             ),
             orientation: Quat::from_axis_angle(
                 Vec3::new(rng.gen(), rng.gen(), rng.gen()).normalize(),
@@ -300,45 +331,129 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         });
     }
 
-    let draw_commands_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::INDIRECT,
-        size: mesh_draws.len() as u64 * std::mem::size_of::<[u32; 5]>() as u64,
+    let num_draws_aligned = (((mesh_draws.len() + 31) / 32) * 32) as u64;
+
+    let frame_visibility_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("frame_visibility_buffer"),
+        usage: wgpu::BufferUsage::STORAGE,
+        size: num_draws_aligned * std::mem::size_of::<u32>() as u64,
         mapped_at_creation: false,
     });
 
-    let mesh_draw_buffer = device.create_buffer_init(&BufferInitDescriptor {
-        label: None,
+    let draw_commands_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("draw_commands_buffer"),
+        usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::INDIRECT,
+        size: num_draws_aligned * std::mem::size_of::<[u32; 5]>() as u64,
+        mapped_at_creation: false,
+    });
+
+    let mesh_draw_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mesh_draw_buffer"),
         usage: wgpu::BufferUsage::STORAGE,
-        contents: as_bytes(&mesh_draws),
+        size: num_draws_aligned * std::mem::size_of::<MeshDraw>() as u64,
+        mapped_at_creation: true,
+    });
+
+    mesh_draw_buffer.slice(..).get_mapped_range_mut()
+        [..mesh_draws.len() * std::mem::size_of::<MeshDraw>()]
+        .copy_from_slice(as_bytes(&mesh_draws));
+    mesh_draw_buffer.unmap();
+
+    let pyramid_size = wgpu::Extent3d {
+        width: (size.width / 2 + 1).next_power_of_two(),
+        height: (size.height / 2 + 1).next_power_of_two(),
+        depth_or_array_layers: 1,
+    };
+
+    let mut pyramid_desc = wgpu::TextureDescriptor {
+        label: Some("depth pyramid"),
+        size: pyramid_size,
+        mip_level_count: pyramid_size.max_mips() as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsage::STORAGE | wgpu::TextureUsage::SAMPLED,
+    };
+
+    let mut _pyramid = device.create_texture(&pyramid_desc);
+    let mut _pyramid_view = _pyramid.create_view(&pyramid_view_desc);
+
+    let pyramid_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("pyramid sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        lod_min_clamp: 0.0,
+        lod_max_clamp: std::f32::MAX,
+        compare: None,
+        anisotropy_clamp: None,
+        border_color: None,
     });
 
     let num_mesh_draws = mesh_draws.len() as u32;
     drop(mesh_draws);
 
-    // Load the shaders from disk
-    let shader = load_shader(&device, "shader.wgsl");
-
     let visibility_shader_set: ShaderSet =
         vec![shader.entry("visibility_vs"), shader.entry("visibility_fs")].into();
 
-    let emit_draws_shader_set: ShaderSet = vec![shader.entry("emit_draws")].into();
+    let cull_early_shader_set: ShaderSet = vec![shader.entry("cull_early")].into();
+    let cull_late_shader_set: ShaderSet = vec![shader.entry("cull_late")].into();
+    let depth_reduce_shader_set: ShaderSet = vec![reduce_shader.entry("depth_reduce")].into();
 
-    let mut comp_bind_group_template = emit_draws_shader_set.pipeline_template(&device);
-    let comp_bind_group = comp_bind_group_template
+    let depth_reduce_bind_group_template = depth_reduce_shader_set.pipeline_template(&device);
+    let mut depth_reduce_bind_groups = make_depth_reduce(
+        &device,
+        &pyramid_desc,
+        &_depth_image,
+        &_pyramid,
+        &pyramid_info_buffer,
+        &depth_reduce_bind_group_template,
+    );
+
+    let cull_early_bind_group_template = cull_early_shader_set.pipeline_template(&device);
+    let cull_early_bind_group = cull_early_bind_group_template
+        .bind_group(0)
         .bind("camera", &camera_buffer)
         .bind("mesh_buffer", &mesh_buffer)
         .bind("mesh_draw_buffer", &mesh_draw_buffer)
         .bind("cmd_buffer", &draw_commands_buffer)
-        .build_bind_group(&device, 0);
+        .bind("visibility_buffer", &frame_visibility_buffer)
+        .build(&device);
 
-    let mut draw_bind_group_template = visibility_shader_set.pipeline_template(&device);
+    let cull_late_bind_group_template = cull_late_shader_set.pipeline_template(&device);
+    let cull_late_bind_group_0 = cull_late_bind_group_template
+        .bind_group(0)
+        .bind("camera", &camera_buffer)
+        .bind("mesh_buffer", &mesh_buffer)
+        .bind("mesh_draw_buffer", &mesh_draw_buffer)
+        .bind("cmd_buffer", &draw_commands_buffer)
+        .bind("visibility_buffer", &frame_visibility_buffer)
+        .build(&device);
+
+    let mut cull_late_bind_group_1 = cull_late_bind_group_template
+        .bind_group(1)
+        .bind("depth_pyramid", &_pyramid_view)
+        .bind("pyramid_info", &pyramid_info_buffer)
+        .bind("depth_pyramid_sampler", &pyramid_sampler)
+        .build(&device);
+
+    let draw_bind_group_template = visibility_shader_set.pipeline_template(&device);
     let draw_bind_group = draw_bind_group_template
+        .bind_group(0)
         .bind("camera", &camera_buffer)
         .bind("mesh_draw_buffer", &mesh_draw_buffer)
-        .build_bind_group(&device, 0);
+        .build(&device);
 
-    let comp_pipeline = comp_bind_group_template.compute_pipeline(&device, &emit_draws_shader_set);
+    let cull_early_pipeline =
+        cull_early_bind_group_template.compute_pipeline(&device, &cull_early_shader_set);
+    let cull_late_pipeline =
+        cull_late_bind_group_template.compute_pipeline(&device, &cull_late_shader_set);
+    let depth_reduce_pipeline =
+        depth_reduce_bind_group_template.compute_pipeline(&device, &depth_reduce_shader_set);
+
     let render_pipeline = draw_bind_group_template.graphics_pipeline(
         &device,
         &visibility_shader_set,
@@ -351,7 +466,10 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 shader_location: 0,
             }],
         }],
-        &[swapchain_format.into()],
+        &[wgpu::ColorTargetState {
+            // blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            ..swapchain_format.into()
+        }],
         Some(wgpu::DepthStencilState {
             format: depth_desc.format,
             depth_write_enabled: true,
@@ -378,7 +496,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         count: num_timestamps,
     });
 
-    let num_statistics = 3;
+    let num_statistics = 6;
     let statistics_query = device.create_query_set(&wgpu::QuerySetDescriptor {
         ty: wgpu::QueryType::PipelineStatistics(
             wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
@@ -389,7 +507,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     });
 
     let timestamp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
+        label: Some("timestamp_buffer"),
         usage: wgpu::BufferUsage::COPY_DST | wgpu::BufferUsage::MAP_READ,
         size: num_timestamps as u64 * std::mem::size_of::<u64>() as u64
             + num_statistics as u64 * std::mem::size_of::<u64>() as u64,
@@ -412,14 +530,38 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
             }
             match event {
                 WindowEvent::Resized(size) => {
+                    if size.width == 0 || size.height == 0 {
+                        return;
+                    }
                     sc_desc.width = size.width;
                     sc_desc.height = size.height;
                     depth_desc.size.width = size.width;
                     depth_desc.size.height = size.height;
+                    pyramid_desc.size.width = (size.width / 2 + 1).next_power_of_two();
+                    pyramid_desc.size.height = (size.height / 2 + 1).next_power_of_two();
+                    pyramid_desc.mip_level_count = pyramid_desc.size.max_mips() as u32;
 
                     swap_chain = device.create_swap_chain(&surface, &sc_desc);
                     _depth_image = device.create_texture(&depth_desc);
                     depth_image_view = _depth_image.create_view(&depth_view_desc);
+                    _pyramid = device.create_texture(&pyramid_desc);
+                    _pyramid_view = _pyramid.create_view(&pyramid_view_desc);
+
+                    depth_reduce_bind_groups = make_depth_reduce(
+                        &device,
+                        &pyramid_desc,
+                        &_depth_image,
+                        &_pyramid,
+                        &pyramid_info_buffer,
+                        &depth_reduce_bind_group_template,
+                    );
+
+                    cull_late_bind_group_1 = cull_late_bind_group_template
+                        .bind_group(1)
+                        .bind("depth_pyramid", &_pyramid_view)
+                        .bind("pyramid_info", &pyramid_info_buffer)
+                        .bind("depth_pyramid_sampler", &pyramid_sampler)
+                        .build(&device);
                 }
                 WindowEvent::ModifiersChanged(state) => {
                     modifiers = state;
@@ -551,24 +693,44 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                         .unwrap(),
                     &device,
                 )
-                .copy_from_slice(as_bytes(std::slice::from_ref(&camera)));
+                .copy_from_slice(ref_as_bytes(&camera));
 
-            staging_belt.finish();
-            // encode passes
-            encoder.write_timestamp(&timestamps_query, 0);
-            {
-                let mut comp_pass =
-                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-                comp_pass.set_pipeline(&comp_pipeline);
-                comp_pass.set_bind_group(0, &comp_bind_group, &[]);
-                comp_pass.dispatch((num_mesh_draws + 31) / 32, 1, 1);
+            let size = window.inner_size();
+            if pyramid_info.width != size.width || pyramid_info.height != size.height {
+                pyramid_info.width = size.width;
+                pyramid_info.height = size.height;
+                staging_belt
+                    .write_buffer(
+                        &mut encoder,
+                        &pyramid_info_buffer,
+                        0,
+                        wgpu::BufferSize::new(
+                            std::mem::size_of::<PyramidInfo>() as wgpu::BufferAddress
+                        )
+                        .unwrap(),
+                        &device,
+                    )
+                    .copy_from_slice(ref_as_bytes(&pyramid_info));
             }
 
-            encoder.write_timestamp(&timestamps_query, 1);
+            staging_belt.finish();
 
+            // encode passes
+
+            encoder.write_timestamp(&timestamps_query, 0);
+            {
+                let mut comp_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("early cull"),
+                });
+                comp_pass.set_pipeline(&cull_early_pipeline);
+                if let Some(group) = &cull_early_bind_group {
+                    comp_pass.set_bind_group(0, &group, &[]);
+                }
+                comp_pass.dispatch((num_mesh_draws + 31) / 32, 1, 1);
+            }
             {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
+                    label: Some("early render"),
                     color_attachments: &[wgpu::RenderPassColorAttachment {
                         view: &frame.view,
                         resolve_target: None,
@@ -587,18 +749,81 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                     }),
                 });
                 render_pass.set_pipeline(&render_pipeline);
-                render_pass.set_bind_group(0, &draw_bind_group, &[]);
+                if let Some(group) = &draw_bind_group {
+                    render_pass.set_bind_group(0, &group, &[]);
+                }
                 render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.begin_pipeline_statistics_query(&statistics_query, 0);
                 render_pass.multi_draw_indexed_indirect(&draw_commands_buffer, 0, num_mesh_draws);
                 render_pass.end_pipeline_statistics_query();
             }
+            encoder.write_timestamp(&timestamps_query, 1);
+            {
+                let mut comp_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("build pyramid"),
+                });
+                comp_pass.set_pipeline(&depth_reduce_pipeline);
+                for (i, bind_group) in depth_reduce_bind_groups.iter().enumerate() {
+                    // TODO: make sure to cover enough
+                    let x = pyramid_info.width >> (i + 1);
+                    let y = pyramid_info.height >> (i + 1);
+                    if let Some(group) = bind_group {
+                        comp_pass.set_bind_group(0, group, &[]);
+                    }
+                    comp_pass.set_push_constants(0, ref_as_bytes(&(i as u32)));
+                    comp_pass.dispatch((x + 31) / 32, (y + 31) / 32, 1);
+                }
+            }
+            {
+                let mut comp_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("late cull"),
+                });
+                comp_pass.set_pipeline(&cull_late_pipeline);
+                if let Some(group) = &cull_late_bind_group_0 {
+                    comp_pass.set_bind_group(0, &group, &[]);
+                }
+                if let Some(group) = &cull_late_bind_group_1 {
+                    comp_pass.set_bind_group(1, &group, &[]);
+                }
+                comp_pass.dispatch((num_mesh_draws + 31) / 32, 1, 1);
+            }
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("late render"),
+                    color_attachments: &[wgpu::RenderPassColorAttachment {
+                        view: &frame.view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: true,
+                        },
+                    }],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_image_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: false,
+                        }),
+                        stencil_ops: None,
+                    }),
+                });
+                render_pass.set_pipeline(&render_pipeline);
+                if let Some(group) = &draw_bind_group {
+                    render_pass.set_bind_group(0, &group, &[]);
+                }
+                render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.begin_pipeline_statistics_query(&statistics_query, 1);
+                render_pass.multi_draw_indexed_indirect(&draw_commands_buffer, 0, num_mesh_draws);
+                render_pass.end_pipeline_statistics_query();
+            }
+
             encoder.write_timestamp(&timestamps_query, 2);
             encoder.resolve_query_set(&timestamps_query, 0..num_timestamps, &timestamp_buffer, 0);
             encoder.resolve_query_set(
                 &statistics_query,
-                0..1,
+                0..2,
                 &timestamp_buffer,
                 num_timestamps as u64 * std::mem::size_of::<u64>() as u64,
             );
@@ -621,26 +846,29 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 )
             };
 
-            let gpu_time_compute = (stats_u64[1] - stats_u64[0]) as f64 * ts_period as f64;
-            let gpu_time_draw = (stats_u64[2] - stats_u64[1]) as f64 * ts_period as f64;
+            let gpu_time_early = (stats_u64[1] - stats_u64[0]) as f64 * ts_period as f64;
+            let gpu_time_late = (stats_u64[2] - stats_u64[1]) as f64 * ts_period as f64;
             let gpu_time_total = (stats_u64[2] - stats_u64[0]) as f64 * ts_period as f64;
 
-            let num_vertices = stats_u64[num_timestamps as usize + 0];
-            let num_triangles = stats_u64[num_timestamps as usize + 1];
-            let num_fragments = stats_u64[num_timestamps as usize + 2];
+            let num_vertices_early = stats_u64[num_timestamps as usize + 0];
+            let num_triangles_early = stats_u64[num_timestamps as usize + 1];
+            let num_fragments_early = stats_u64[num_timestamps as usize + 2];
+            let num_vertices_late = stats_u64[num_timestamps as usize + 3];
+            let num_triangles_late = stats_u64[num_timestamps as usize + 4];
+            let num_fragments_late = stats_u64[num_timestamps as usize + 5];
 
             drop(stats);
             timestamp_buffer.unmap();
 
             let title = format!(
-                "dovetail :: GPU: {} comp: {} draw: {} | CPU: {} | {}t {}v {}f",
+                "dovetail :: GPU: {} early: {} late: {} | CPU: {} | {}t {}v {}f",
                 DisplayTime::from_ns(gpu_time_total),
-                DisplayTime::from_ns(gpu_time_compute),
-                DisplayTime::from_ns(gpu_time_draw),
+                DisplayTime::from_ns(gpu_time_early),
+                DisplayTime::from_ns(gpu_time_late),
                 DisplayTime(cpu_time),
-                num_triangles,
-                num_vertices,
-                num_fragments,
+                num_triangles_early + num_triangles_late,
+                num_vertices_early + num_vertices_late,
+                num_fragments_early + num_fragments_late,
                 // use_indirect_draw
             );
             window.set_title(&title);
@@ -738,4 +966,39 @@ fn bounding_sphere(vertices: &[Vertex]) -> Vec4 {
             return origin.extend(radius);
         }
     }
+}
+
+fn make_depth_reduce(
+    device: &wgpu::Device,
+    pyramid_desc: &wgpu::TextureDescriptor,
+    depth: &wgpu::Texture,
+    pyramid: &wgpu::Texture,
+    pyramid_info_buffer: &wgpu::Buffer,
+    depth_reduce_template: &PipelineTemplate,
+) -> Vec<Option<wgpu::BindGroup>> {
+    let count = pyramid_desc.mip_level_count;
+    let mut desc = wgpu::TextureViewDescriptor {
+        format: Some(wgpu::TextureFormat::Depth32Float),
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        base_mip_level: 0,
+        mip_level_count: Some(NonZeroU32::new(1).unwrap()),
+        ..Default::default()
+    };
+    let mut last_view = depth.create_view(&desc);
+    desc.format = Some(wgpu::TextureFormat::R32Float);
+
+    (0..count)
+        .map(|i| {
+            desc.base_mip_level = i;
+            let next_view = pyramid.create_view(&desc);
+            let bind_group = depth_reduce_template
+                .bind_group(0)
+                .bind("image_src", &last_view)
+                .bind("image_dst", &next_view)
+                .bind("pyramid_info", pyramid_info_buffer)
+                .build(&device);
+            last_view = next_view;
+            bind_group
+        })
+        .collect()
 }

@@ -54,14 +54,19 @@ impl<'a> From<Vec<ShaderEntryPoint<'a>>> for ShaderSet<'a> {
     }
 }
 
-pub struct PipelineTemplate<'a> {
+pub struct PipelineTemplate {
     layouts: Vec<wgpu::BindGroupLayout>,
     pipeline_layout: wgpu::PipelineLayout,
     binding_types: HashMap<String, ((u32, u32), BindingType)>,
-    bindings: HashMap<(u32, u32), wgpu::BindingResource<'a>>,
 }
 
-impl<'a> PipelineTemplate<'a> {
+pub struct BindGroupBuilder<'a> {
+    template: &'a PipelineTemplate,
+    group: u32,
+    bindings: HashMap<u32, wgpu::BindingResource<'a>>,
+}
+
+impl PipelineTemplate {
     pub fn compute_pipeline(
         &self,
         device: &wgpu::Device,
@@ -86,7 +91,7 @@ impl<'a> PipelineTemplate<'a> {
         &self,
         device: &wgpu::Device,
         shader_set: &ShaderSet,
-        buffers: &'a [wgpu::VertexBufferLayout<'a>],
+        buffers: &[wgpu::VertexBufferLayout<'_>],
         targets: &[wgpu::ColorTargetState],
         depth_stencil: Option<wgpu::DepthStencilState>,
     ) -> wgpu::RenderPipeline {
@@ -104,24 +109,20 @@ impl<'a> PipelineTemplate<'a> {
         })
     }
 
-    // pub fn clear(&mut self) -> &mut Self {
-    //     self.bindings.clear();
-    //     self
-    // }
+    pub fn bind_group(&self, group: u32) -> BindGroupBuilder<'_> {
+        BindGroupBuilder {
+            template: self,
+            group,
+            bindings: Default::default(),
+        }
+    }
+}
 
-    // pub fn unbind(&mut self, name: &str) -> &mut Self {
-    //     let (id, ty) = self
-    //         .binding_types
-    //         .get(name)
-    //         .unwrap_or_else(|| panic!("invalid binding name '{}'", name));
-    //     self.bindings.remove(id);
-    //     self
-    // }
-
+impl<'a> BindGroupBuilder<'a> {
     pub fn bind(&mut self, name: &str, resource: impl IntoResource<'a>) -> &mut Self {
-        let (id, ty) = match self.binding_types.get(name) {
-            Some(b) => b,
-            None => {
+        let (id, ty) = match self.template.binding_types.get(name) {
+            Some(((g, b), ty)) if *g == self.group => (b, ty),
+            _ => {
                 // panic!("invalid binding name '{}'", name)
                 return self;
             }
@@ -142,21 +143,25 @@ impl<'a> PipelineTemplate<'a> {
         self
     }
 
-    pub fn build_bind_group(&self, device: &wgpu::Device, group: u32) -> wgpu::BindGroup {
-        let entries = self
-            .bindings
-            .iter()
-            .filter(|((g, _), _)| *g == group)
-            .map(|((_, binding), resource)| wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: resource.clone(),
-            })
-            .collect::<Vec<_>>();
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.layouts[group as usize],
-            entries: &entries,
-        })
+    pub fn build(&self, device: &wgpu::Device) -> Option<wgpu::BindGroup> {
+        if let Some(layout) = self.template.layouts.get(self.group as usize) {
+            let entries = self
+                .bindings
+                .iter()
+                .map(|(binding, resource)| wgpu::BindGroupEntry {
+                    binding: *binding,
+                    resource: resource.clone(),
+                })
+                .collect::<Vec<_>>();
+
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout,
+                entries: &entries,
+            }))
+        } else {
+            None
+        }
     }
 }
 
@@ -186,14 +191,26 @@ impl<'a> IntoResource<'a> for &'a wgpu::Buffer {
     }
 }
 
-// TODO: more into impls
+impl<'a> IntoResource<'a> for &'a wgpu::TextureView {
+    fn into(self) -> wgpu::BindingResource<'a> {
+        wgpu::BindingResource::TextureView(self)
+    }
+}
+
+impl<'a> IntoResource<'a> for &'a wgpu::Sampler {
+    fn into(self) -> wgpu::BindingResource<'a> {
+        wgpu::BindingResource::Sampler(self)
+    }
+}
 
 impl ShaderSet<'_> {
     pub fn pipeline_template(&self, device: &wgpu::Device) -> PipelineTemplate {
         let mut bindings: Vec<HashMap<u32, wgpu::BindGroupLayoutEntry>> = Vec::new();
+        let mut push_constants: Vec<wgpu::PushConstantRange> = Vec::new();
         let mut binding_types = HashMap::new();
         for ep in &self.entry_points {
             let ep_info = ep.shader.info.get_entry_point(ep.entry_point_index);
+            let stage = ep.stage();
             let module = &ep.shader.naga_module;
             for (var_handle, var) in module.global_variables.iter() {
                 if let Some(ref binding) = var.binding {
@@ -208,7 +225,7 @@ impl ShaderSet<'_> {
                         match group_bindings.entry(binding.binding) {
                             Entry::Occupied(mut entry) => {
                                 let val = entry.get_mut();
-                                val.visibility |= ep.stage();
+                                val.visibility |= stage;
                                 merge_bindings(&mut val.ty, ty);
                                 binding_types.insert(
                                     var.name.clone().unwrap(),
@@ -222,12 +239,24 @@ impl ShaderSet<'_> {
                                 );
                                 entry.insert(wgpu::BindGroupLayoutEntry {
                                     binding: binding.binding,
-                                    visibility: ep.stage(),
+                                    visibility: stage,
                                     ty,
                                     count: None,
                                 });
                             }
                         }
+                    }
+                } else if var.class == naga::StorageClass::PushConstant {
+                    // TODO: figure out type size. For now, let's just assume single u32;
+                    let range = 0..4;
+
+                    if let Some(existing) = push_constants.iter_mut().find(|p| p.range == range) {
+                        existing.stages |= stage;
+                    } else {
+                        push_constants.push(wgpu::PushConstantRange {
+                            stages: stage,
+                            range,
+                        })
                     }
                 }
             }
@@ -247,14 +276,13 @@ impl ShaderSet<'_> {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &layouts.iter().collect::<Vec<_>>(),
-            push_constant_ranges: &[],
+            push_constant_ranges: &push_constants,
         });
 
         PipelineTemplate {
             layouts,
             pipeline_layout,
             binding_types,
-            bindings: HashMap::new(),
         }
     }
 
