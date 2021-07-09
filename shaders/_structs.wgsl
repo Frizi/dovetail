@@ -17,12 +17,19 @@ struct Mesh {
     levels: array<MeshLod, 8>;
 };
 
-struct DrawCmd {
+struct DrawCmdIndexed {
     index_count: u32;
     instance_count: u32;
     first_index: u32;
     base_vertex: u32;
     first_instance: u32;
+};
+
+struct DrawCmd {
+    vertex_count: u32;
+    instance_count: u32;
+    base_vertex: u32;
+    base_instance: u32;
 };
 
 [[block]]

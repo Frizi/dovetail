@@ -19,7 +19,12 @@ mod util;
 use shader::*;
 use util::*;
 
-type Vertex = obj::Position;
+// type Vertex = obj::Position;
+
+#[derive(Clone, Copy)]
+struct Vertex {
+    position: Vec4,
+}
 
 fn load_mesh(
     path: impl AsRef<Path>,
@@ -28,11 +33,18 @@ fn load_mesh(
 ) -> Mesh {
     let reader =
         std::io::BufReader::new(std::fs::File::open(path).expect("Failed to open mesh file"));
-    let model: obj::Obj<Vertex, u32> = obj::load_obj(reader).expect("Failed to parse obj");
+    let model: obj::Obj<obj::Position, u32> = obj::load_obj(reader).expect("Failed to parse obj");
 
     let vertex_offset = vertex_buffer.len() as u32;
     let vertex_count = model.vertices.len() as u32;
-    let vert_bytes = as_bytes(&model.vertices);
+    let vertices: Vec<Vertex> = model
+        .vertices
+        .into_iter()
+        .map(|v| Vertex {
+            position: Vec4::new(v.position[0], v.position[1], v.position[2], 1.0),
+        })
+        .collect();
+    let vert_bytes = as_bytes(&vertices);
 
     let adapter = meshopt::VertexDataAdapter::new(
         vert_bytes,
@@ -41,8 +53,8 @@ fn load_mesh(
     )
     .expect("Failed to create vertex data adapter");
 
-    let opt_indices = meshopt::optimize_vertex_cache(&model.indices, model.vertices.len());
-    let bound_sphere = bounding_sphere(&model.vertices);
+    let opt_indices = meshopt::optimize_vertex_cache(&model.indices, vertices.len());
+    let bound_sphere = bounding_sphere(&vertices);
 
     const LOD_INIT: MeshLod = MeshLod {
         index_count: 0,
@@ -56,7 +68,7 @@ fn load_mesh(
         index_count: opt_indices.len() as u32,
     };
 
-    vertex_buffer.extend_from_slice(&model.vertices);
+    vertex_buffer.extend_from_slice(&vertices);
     index_buffer.extend_from_slice(&opt_indices);
 
     let mut simplified_indices = Vec::new();
@@ -75,7 +87,7 @@ fn load_mesh(
             max_lod = level - 1;
             break;
         }
-        meshopt::optimize_vertex_cache_in_place(&simplified_indices, model.vertices.len());
+        meshopt::optimize_vertex_cache_in_place(&simplified_indices, vertices.len());
 
         let index_offset = index_buffer.len() as u32;
         let index_count = simplified_indices.len() as u32;
@@ -297,14 +309,16 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("index_buffer"),
-        usage: wgpu::BufferUsage::INDEX,
+        // usage: wgpu::BufferUsage::INDEX,
+        usage: wgpu::BufferUsage::VERTEX,
         contents: as_bytes(&index_data),
     });
     drop(index_data);
 
     let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("vertex_buffer"),
-        usage: wgpu::BufferUsage::VERTEX,
+        usage: wgpu::BufferUsage::STORAGE,
+        // usage: wgpu::BufferUsage::VERTEX,
         contents: as_bytes(&vertex_data),
     });
     drop(vertex_data);
@@ -313,7 +327,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(42424242);
 
-    for i in 0..1024 * 64 {
+    for i in 0..512 {
         let mesh_index = i % meshes.len();
         let bound = meshes[mesh_index].bound_sphere;
         mesh_draws.push(MeshDraw {
@@ -321,7 +335,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 rng.gen_range(-100.0..=100.0) - bound.x / bound.w,
                 rng.gen_range(-100.0..=100.0) - bound.y / bound.w,
                 rng.gen_range(-100.0..=100.0) - bound.z / bound.w,
-                rng.gen_range(10.0..30.0) / bound.w,
+                rng.gen_range(1.0..5.0) / bound.w,
             ),
             orientation: Quat::from_axis_angle(
                 Vec3::new(rng.gen(), rng.gen(), rng.gen()).normalize(),
@@ -396,8 +410,11 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     let num_mesh_draws = mesh_draws.len() as u32;
     drop(mesh_draws);
 
-    let visibility_shader_set: ShaderSet =
-        vec![shader.entry("visibility_vs"), shader.entry("visibility_fs")].into();
+    let visibility_shader_set: ShaderSet = vec![
+        shader.entry("visibility_vs2"),
+        shader.entry("visibility_fs"),
+    ]
+    .into();
 
     let cull_early_shader_set: ShaderSet = vec![shader.entry("cull_early")].into();
     let cull_late_shader_set: ShaderSet = vec![shader.entry("cull_late")].into();
@@ -444,7 +461,9 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     let draw_bind_group = draw_bind_group_template
         .bind_group(0)
         .bind("camera", &camera_buffer)
+        .bind("mesh_buffer", &mesh_buffer)
         .bind("mesh_draw_buffer", &mesh_draw_buffer)
+        .bind("vertex_buffer", &vertex_buffer)
         .build(&device);
 
     let cull_early_pipeline =
@@ -458,10 +477,12 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         &device,
         &visibility_shader_set,
         &[wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as u64,
+            // array_stride: std::mem::size_of::<Vertex>() as u64,
+            array_stride: std::mem::size_of::<u32>() as u64,
             step_mode: wgpu::InputStepMode::Vertex,
             attributes: &[wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x3,
+                // format: wgpu::VertexFormat::Float32x3,
+                format: wgpu::VertexFormat::Uint32,
                 offset: 0,
                 shader_location: 0,
             }],
@@ -673,8 +694,8 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 .fold(Vec3::ZERO, |a, b| a + b);
 
             let move_speed = match modifiers.contains(ModifiersState::SHIFT) {
-                true => 25.0,
-                false => 10.0,
+                true => 100.0,
+                false => 25.0,
             };
 
             camera_pos += camera_quat * (move_input_vec * move_speed * delta_time.as_secs_f32());
@@ -752,10 +773,11 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 if let Some(group) = &draw_bind_group {
                     render_pass.set_bind_group(0, &group, &[]);
                 }
-                render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                // render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                // render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(0, index_buffer.slice(..));
                 render_pass.begin_pipeline_statistics_query(&statistics_query, 0);
-                render_pass.multi_draw_indexed_indirect(&draw_commands_buffer, 0, num_mesh_draws);
+                render_pass.multi_draw_indirect(&draw_commands_buffer, 0, num_mesh_draws);
                 render_pass.end_pipeline_statistics_query();
             }
             encoder.write_timestamp(&timestamps_query, 1);
@@ -812,10 +834,12 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 if let Some(group) = &draw_bind_group {
                     render_pass.set_bind_group(0, &group, &[]);
                 }
-                render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                // render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                // render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(0, index_buffer.slice(..));
                 render_pass.begin_pipeline_statistics_query(&statistics_query, 1);
-                render_pass.multi_draw_indexed_indirect(&draw_commands_buffer, 0, num_mesh_draws);
+                render_pass.multi_draw_indirect(&draw_commands_buffer, 0, num_mesh_draws);
+                // render_pass.multi_draw_indexed_indirect(&draw_commands_buffer, 0, num_mesh_draws);
                 render_pass.end_pipeline_statistics_query();
             }
 

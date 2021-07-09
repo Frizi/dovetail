@@ -2,6 +2,14 @@
 name = "dovetail"
 version = "0.1.0"
 edition = "2018"
+default-run = "dovetail"
+
+[[bin]]
+name = "dovetail"
+
+[[bin]]
+name = "convert"
+path = "src/convert.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

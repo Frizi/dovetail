@@ -57,8 +57,6 @@ fn project_sphere(sphere: vec4<f32>, znear: f32, P00: f32, P11: f32) -> SpherePr
     return SphereProj(true, clamp(aabb, vec4<f32>(0.0), vec4<f32>(1.0)));
 }
 
-
-
 fn select_lod(mesh_index: u32, center: vec3<f32>) -> MeshLod {
     let eye_pos = camera.position;
     let lod_base = 14.0;
@@ -74,7 +72,7 @@ fn cull_early(
     [[builtin(global_invocation_id)]] global_id: vec3<u32>,
 ) {
     if (visibility_buffer.vis[global_id.x] == 0u) {
-        cmd_buffer.commands[global_id.x] = DrawCmd(0u, 0u, 0u, 0u, 0u);
+        cmd_buffer.commands[global_id.x] = DrawCmd(0u, 0u, 0u, 0u);
 		return;
     }
     let draw = mesh_draw_buffer.mesh_draws[global_id.x];
@@ -91,7 +89,7 @@ fn cull_early(
         lod.index_count,
         bool_to_uint(visible),
         lod.index_offset,
-        mesh_buffer.meshes[mesh_index].vertex_offset,
+        // mesh_buffer.meshes[mesh_index].vertex_offset,
         global_id.x,
     );
 }
@@ -143,9 +141,10 @@ fn cull_late(
         lod.index_count,
         bool_to_uint(visible && visibility_buffer.vis[global_id.x] == 0u),
         lod.index_offset,
-        mesh_buffer.meshes[mesh_index].vertex_offset,
+        // mesh_buffer.meshes[mesh_index].vertex_offset,
         global_id.x,
     );
+
     visibility_buffer.vis[global_id.x] = bool_to_uint(visible);
 }
 
@@ -155,20 +154,65 @@ struct VertexOutput {
     [[location(2), interpolate(flat)]] vertex_index: u32;
 };
 
+struct VertexOutput2 {
+    [[builtin(position)]] position: vec4<f32>;
+    [[location(1), interpolate(flat)]] instance_index: u32;
+    [[location(2), interpolate(flat)]] triangle_id: u32;
+};
+
+// [[stage(vertex)]]
+// fn visibility_vs(
+//     [[builtin(instance_index)]] instance_index: u32,
+//     [[builtin(vertex_index)]] vertex_index: u32,
+//     [[location(0)]] position: vec3<f32>,
+// ) -> VertexOutput {
+//     let mesh_draw = mesh_draw_buffer.mesh_draws[instance_index];
+//     var pos: vec3<f32> = position;
+//     pos = rotate_quat(pos * mesh_draw.position_scale.w, mesh_draw.orientation) + mesh_draw.position_scale.xyz;
+//     return VertexOutput(
+//         camera.view_proj * vec4<f32>(pos, 1.0),
+//         instance_index,
+//         vertex_index,
+//     );
+// }
+
+struct Vertex {
+    position: vec3<f32>;
+};
+
+[[block]]
+struct VertexData {
+    vertices: array<Vertex>;
+};
+
+[[group(0), binding(5)]]
+var<storage> vertex_buffer: [[access(read)]] VertexData;
+
+
 [[stage(vertex)]]
-fn visibility_vs(
+fn visibility_vs2(
     [[builtin(instance_index)]] instance_index: u32,
-    [[builtin(vertex_index)]] vertex_index: u32,
-    [[location(0)]] position: vec3<f32>,
-) -> VertexOutput {
+    [[builtin(vertex_index)]] triangle_id: u32,
+    [[location(0)]] index_buffer_data: u32,
+) -> VertexOutput2 {
+    // let triangle_id = triangle_id / 3u;
     let mesh_draw = mesh_draw_buffer.mesh_draws[instance_index];
-    var pos: vec3<f32> = position;
-    pos = rotate_quat(pos * mesh_draw.position_scale.w, mesh_draw.orientation) + mesh_draw.position_scale.xyz;
-    return VertexOutput(
+    let offset = mesh_buffer.meshes[mesh_draw.mesh_index].vertex_offset;
+    let index = index_buffer_data + offset;
+
+    let pos = vertex_buffer.vertices[index].position;
+    let pos = rotate_quat(pos * mesh_draw.position_scale.w, mesh_draw.orientation) + mesh_draw.position_scale.xyz;
+    
+    return VertexOutput2(
         camera.view_proj * vec4<f32>(pos, 1.0),
         instance_index,
-        vertex_index,
+        triangle_id,
     );
+}
+
+[[stage(fragment)]]
+fn visibility_fs2(input: VertexOutput2) -> [[location(0)]] u32 {
+    return input.triangle_id;
 }
 
 [[stage(fragment)]]
