@@ -32,15 +32,15 @@ pub struct ShaderSet<'a> {
 
 impl<'a> From<Vec<ShaderEntryPoint<'a>>> for ShaderSet<'a> {
     fn from(entry_points: Vec<ShaderEntryPoint<'a>>) -> Self {
-        let mut stage_mask = wgpu::ShaderStage::empty();
+        let mut stage_mask = wgpu::ShaderStages::empty();
         for ep in &entry_points {
             let stage = ep.stage();
             if stage_mask.intersects(stage) {
                 panic!("Cannot use multiple entry points for single stage");
             }
 
-            if (stage == wgpu::ShaderStage::COMPUTE && stage_mask != wgpu::ShaderStage::empty())
-                || stage_mask.contains(wgpu::ShaderStage::COMPUTE)
+            if (stage == wgpu::ShaderStages::COMPUTE && stage_mask != wgpu::ShaderStages::empty())
+                || stage_mask.contains(wgpu::ShaderStages::COMPUTE)
             {
                 panic!("Cannot mix compute and graphics shaders in single shader set.");
             }
@@ -76,7 +76,7 @@ impl PipelineTemplate {
         assert_eq!(shader_set.entry_points.len(), 1);
         assert_eq!(
             shader_set.entry_points[0].stage(),
-            wgpu::ShaderStage::COMPUTE
+            wgpu::ShaderStages::COMPUTE
         );
 
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -106,6 +106,7 @@ impl PipelineTemplate {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil,
             multisample: wgpu::MultisampleState::default(),
+            multiview: None,
         })
     }
 
@@ -293,7 +294,7 @@ impl ShaderSet<'_> {
         let entry = self
             .entry_points
             .iter()
-            .find(|e| e.stage() == wgpu::ShaderStage::VERTEX)
+            .find(|e| e.stage() == wgpu::ShaderStages::VERTEX)
             .expect("Vertex shader required");
 
         wgpu::VertexState {
@@ -310,7 +311,7 @@ impl ShaderSet<'_> {
         let entry = self
             .entry_points
             .iter()
-            .find(|e| e.stage() == wgpu::ShaderStage::FRAGMENT)?;
+            .find(|e| e.stage() == wgpu::ShaderStages::FRAGMENT)?;
 
         Some(wgpu::FragmentState {
             module: &entry.shader.module,
@@ -344,18 +345,17 @@ fn merge_bindings(dst: &mut wgpu::BindingType, src: wgpu::BindingType) {
                 (Some(a), Some(b)) => Some(a.max(b)),
             }
         }
-        (
-            wgpu::BindingType::Sampler {
-                filtering,
-                comparison,
-            },
-            wgpu::BindingType::Sampler {
-                filtering: filtering_src,
-                comparison: comparison_src,
-            },
-        ) => {
-            *filtering |= filtering_src;
-            *comparison &= comparison_src;
+        (wgpu::BindingType::Sampler(binding), wgpu::BindingType::Sampler(binding_src)) => {
+            match (binding, binding_src) {
+                (wgpu::SamplerBindingType::Comparison, _) => {}
+                (binding, wgpu::SamplerBindingType::Filtering) => {
+                    *binding = wgpu::SamplerBindingType::Filtering
+                }
+                (binding, wgpu::SamplerBindingType::Comparison) => {
+                    *binding = wgpu::SamplerBindingType::Comparison
+                }
+                (_, wgpu::SamplerBindingType::NonFiltering) => {}
+            }
         }
         (
             wgpu::BindingType::Texture {
@@ -422,8 +422,9 @@ fn reflect_binding_type(
         naga::TypeInner::Struct { .. } => wgpu::BindingType::Buffer {
             ty: match global.class {
                 naga::StorageClass::Uniform => wgpu::BufferBindingType::Uniform,
-                naga::StorageClass::Storage => wgpu::BufferBindingType::Storage {
-                    read_only: !global_use.contains(naga::valid::GlobalUse::WRITE),
+                naga::StorageClass::Storage { access } => wgpu::BufferBindingType::Storage {
+                    read_only: !access.contains(naga::StorageAccess::STORE)
+                        && !global_use.contains(naga::valid::GlobalUse::WRITE),
                 },
                 _ => todo!(),
             },
@@ -449,13 +450,17 @@ fn reflect_binding_type(
         naga::TypeInner::Image {
             dim,
             arrayed,
-            class: naga::ImageClass::Storage(format),
+            class: naga::ImageClass::Storage { format, access },
         } => wgpu::BindingType::StorageTexture {
             access: {
-                if global_use.contains(naga::valid::GlobalUse::READ | naga::valid::GlobalUse::WRITE)
+                if access == naga::StorageAccess::all()
+                    || global_use
+                        .contains(naga::valid::GlobalUse::READ | naga::valid::GlobalUse::WRITE)
                 {
                     wgpu::StorageTextureAccess::ReadWrite
-                } else if global_use.contains(naga::valid::GlobalUse::WRITE) {
+                } else if access == naga::StorageAccess::STORE
+                    || global_use.contains(naga::valid::GlobalUse::WRITE)
+                {
                     wgpu::StorageTextureAccess::WriteOnly
                 } else {
                     wgpu::StorageTextureAccess::ReadOnly
@@ -464,10 +469,12 @@ fn reflect_binding_type(
             format: map_format(format),
             view_dimension: map_view_dimension(dim, arrayed),
         },
-        naga::TypeInner::Sampler { comparison } => wgpu::BindingType::Sampler {
-            filtering: false,
-            comparison,
-        },
+        naga::TypeInner::Sampler { comparison: true } => {
+            wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison)
+        }
+        naga::TypeInner::Sampler { comparison: false } => {
+            wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering)
+        }
         _ => todo!(),
     }
 }
@@ -554,12 +561,12 @@ impl<'a> ShaderEntryPoint<'a> {
         &self.shader.naga_module.entry_points[self.entry_point_index].name
     }
 
-    fn stage(&self) -> wgpu::ShaderStage {
+    fn stage(&self) -> wgpu::ShaderStages {
         // self.shader.ent
         match self.shader.naga_module.entry_points[self.entry_point_index].stage {
-            naga::ShaderStage::Vertex => wgpu::ShaderStage::VERTEX,
-            naga::ShaderStage::Fragment => wgpu::ShaderStage::FRAGMENT,
-            naga::ShaderStage::Compute => wgpu::ShaderStage::COMPUTE,
+            naga::ShaderStage::Vertex => wgpu::ShaderStages::VERTEX,
+            naga::ShaderStage::Fragment => wgpu::ShaderStages::FRAGMENT,
+            naga::ShaderStage::Compute => wgpu::ShaderStages::COMPUTE,
         }
     }
 }
@@ -580,7 +587,6 @@ pub fn load_shader(device: &wgpu::Device, filename: impl AsRef<Path>) -> Shader 
     let shader_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        flags: wgpu::ShaderFlags::all(),
     });
 
     Shader {

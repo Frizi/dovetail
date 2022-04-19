@@ -1,21 +1,21 @@
 [package]
 name = "dovetail"
 version = "0.1.0"
-edition = "2018"
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-winit = "0.25.0"
-glam = "0.16.0"
-wgpu = "0.9.0"
-pollster = "0.2.4"
-tracing = "0.1.26"
-tracing-subscriber = "0.2.18"
+winit = "0.26.1"
+glam = "0.20.5"
+wgpu = "0.12.0"
+pollster = "0.2.5"
+tracing = "0.1.33"
+tracing-subscriber = "0.3.11"
 meshopt = "0.1.9"
-obj-rs = "0.6.3"
-bytemuck = "1.7.0"
-memoffset = "0.6.4"
-naga = { version = "0.5.0", features = ["wgsl-in"] }
+obj-rs = "0.7.0"
+bytemuck = "1.9.1"
+memoffset = "0.6.5"
+naga = { version = "0.8.5", features = ["wgsl-in"] }
 async-executor = "1.4.1"
-rand = { version = "0.8.4", features = ["small_rng"] }
+rand = { version = "0.8.5", features = ["small_rng"] }

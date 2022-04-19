@@ -176,17 +176,19 @@ struct PyramidInfo {
 
 async fn run(event_loop: EventLoop<()>, window: Window) {
     let spawner = Spawner::new();
-    let instance = wgpu::Instance::new(wgpu::BackendBit::all());
+    let instance = wgpu::Instance::new(wgpu::Backends::all());
     let surface = unsafe { instance.create_surface(&window) };
-
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             // Request an adapter which can render to our surface
             compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
         })
         .await
         .expect("Failed to find an appropriate adapter");
+
+    dbg!(adapter.features());
 
     // Create the logical device and command queue
     let (device, queue) = adapter
@@ -211,17 +213,8 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     let shader = load_shader(&device, "shader.wgsl");
     let reduce_shader = load_shader(&device, "depth_reduce.wgsl");
 
-    let swapchain_format = adapter.get_swap_chain_preferred_format(&surface).unwrap();
+    let swapchain_format = surface.get_preferred_format(&adapter).unwrap();
     let size = window.inner_size();
-    let mut sc_desc = wgpu::SwapChainDescriptor {
-        usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
-        format: swapchain_format,
-        width: size.width,
-        height: size.height,
-        present_mode: wgpu::PresentMode::Mailbox,
-    };
-
-    let mut swap_chain = device.create_swap_chain(&surface, &sc_desc);
 
     let mut depth_desc = wgpu::TextureDescriptor {
         label: None,
@@ -234,7 +227,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsage::RENDER_ATTACHMENT | wgpu::TextureUsage::SAMPLED,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
     };
 
     let depth_view_desc = wgpu::TextureViewDescriptor {
@@ -273,7 +266,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         size: std::mem::size_of::<Camera>() as u64,
         mapped_at_creation: false,
     });
@@ -285,26 +278,26 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let pyramid_info_buffer = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("pyramid_info_buffer"),
-        usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         contents: ref_as_bytes(&pyramid_info),
     });
 
     let mesh_buffer = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("mesh_buffer"),
-        usage: wgpu::BufferUsage::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE,
         contents: as_bytes(&meshes),
     });
 
     let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("index_buffer"),
-        usage: wgpu::BufferUsage::INDEX,
+        usage: wgpu::BufferUsages::INDEX,
         contents: as_bytes(&index_data),
     });
     drop(index_data);
 
     let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("vertex_buffer"),
-        usage: wgpu::BufferUsage::VERTEX,
+        usage: wgpu::BufferUsages::VERTEX,
         contents: as_bytes(&vertex_data),
     });
     drop(vertex_data);
@@ -335,21 +328,21 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let frame_visibility_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("frame_visibility_buffer"),
-        usage: wgpu::BufferUsage::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE,
         size: num_draws_aligned * std::mem::size_of::<u32>() as u64,
         mapped_at_creation: false,
     });
 
     let draw_commands_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("draw_commands_buffer"),
-        usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::INDIRECT,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
         size: num_draws_aligned * std::mem::size_of::<[u32; 5]>() as u64,
         mapped_at_creation: false,
     });
 
     let mesh_draw_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("mesh_draw_buffer"),
-        usage: wgpu::BufferUsage::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE,
         size: num_draws_aligned * std::mem::size_of::<MeshDraw>() as u64,
         mapped_at_creation: true,
     });
@@ -372,7 +365,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::R32Float,
-        usage: wgpu::TextureUsage::STORAGE | wgpu::TextureUsage::SAMPLED,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
     };
 
     let mut _pyramid = device.create_texture(&pyramid_desc);
@@ -459,7 +452,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         &visibility_shader_set,
         &[wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
-            step_mode: wgpu::InputStepMode::Vertex,
+            step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[wgpu::VertexAttribute {
                 format: wgpu::VertexFormat::Float32x3,
                 offset: 0,
@@ -493,6 +486,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     let num_timestamps = 3;
     let timestamps_query = device.create_query_set(&wgpu::QuerySetDescriptor {
         ty: wgpu::QueryType::Timestamp,
+        label: Some("timestamps_query"),
         count: num_timestamps,
     });
 
@@ -503,12 +497,13 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 | wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
                 | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
         ),
+        label: Some("statistics_query"),
         count: num_timestamps,
     });
 
     let timestamp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("timestamp_buffer"),
-        usage: wgpu::BufferUsage::COPY_DST | wgpu::BufferUsage::MAP_READ,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         size: num_timestamps as u64 * std::mem::size_of::<u64>() as u64
             + num_statistics as u64 * std::mem::size_of::<u64>() as u64,
         mapped_at_creation: false,
@@ -533,15 +528,12 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                     if size.width == 0 || size.height == 0 {
                         return;
                     }
-                    sc_desc.width = size.width;
-                    sc_desc.height = size.height;
                     depth_desc.size.width = size.width;
                     depth_desc.size.height = size.height;
                     pyramid_desc.size.width = (size.width / 2 + 1).next_power_of_two();
                     pyramid_desc.size.height = (size.height / 2 + 1).next_power_of_two();
                     pyramid_desc.mip_level_count = pyramid_desc.size.max_mips() as u32;
 
-                    swap_chain = device.create_swap_chain(&surface, &sc_desc);
                     _depth_image = device.create_texture(&depth_desc);
                     depth_image_view = _depth_image.create_view(&depth_view_desc);
                     _pyramid = device.create_texture(&pyramid_desc);
@@ -645,13 +637,17 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
             spawner.run_until_stalled();
         }
         Event::RedrawRequested(window_id) if window_id == window.id() => {
-            let frame = match swap_chain.get_current_frame() {
-                Ok(frame) => frame.output,
+            let frame = match surface.get_current_texture() {
+                Ok(frame) => frame,
                 Err(err) => {
                     eprintln!("Failed to acquire next swapchain frame: {}", err);
                     return;
                 }
             };
+
+            let frame_view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
 
             let cpu_time_start = std::time::Instant::now();
 
@@ -732,7 +728,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("early render"),
                     color_attachments: &[wgpu::RenderPassColorAttachment {
-                        view: &frame.view,
+                        view: &frame_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(clear_color),
@@ -792,7 +788,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("late render"),
                     color_attachments: &[wgpu::RenderPassColorAttachment {
-                        view: &frame.view,
+                        view: &frame_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
