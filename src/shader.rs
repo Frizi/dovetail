@@ -47,7 +47,7 @@ impl<'a> From<Vec<ShaderEntryPoint<'a>>> for ShaderSet<'a> {
             stage_mask |= stage;
         }
 
-        if entry_points.len() == 0 {
+        if entry_points.is_empty() {
             panic!("Shader set cannot be empty.");
         }
         Self { entry_points }
@@ -83,7 +83,7 @@ impl PipelineTemplate {
             label: None,
             layout: Some(&self.pipeline_layout),
             module: &shader_set.entry_points[0].shader.module,
-            entry_point: &shader_set.entry_points[0].name(),
+            entry_point: shader_set.entry_points[0].name(),
         })
     }
 
@@ -96,7 +96,7 @@ impl PipelineTemplate {
         depth_stencil: Option<wgpu::DepthStencilState>,
     ) -> wgpu::RenderPipeline {
         // TODO: assert that shader set is compatible
-        assert!(shader_set.entry_points.len() >= 1);
+        assert!(!shader_set.entry_points.is_empty());
 
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
@@ -217,7 +217,7 @@ impl ShaderSet<'_> {
                 if let Some(ref binding) = var.binding {
                     let binding_use = ep_info[var_handle];
                     if !binding_use.is_empty() {
-                        let ty = reflect_binding_type(&module, var, binding_use);
+                        let ty = reflect_binding_type(module, var, binding_use);
 
                         if bindings.len() <= binding.group as usize {
                             bindings.resize_with(1 + binding.group as usize, Default::default);
@@ -230,13 +230,13 @@ impl ShaderSet<'_> {
                                 merge_bindings(&mut val.ty, ty);
                                 binding_types.insert(
                                     var.name.clone().unwrap(),
-                                    ((binding.group, binding.binding), val.ty.clone()),
+                                    ((binding.group, binding.binding), val.ty),
                                 );
                             }
                             Entry::Vacant(entry) => {
                                 binding_types.insert(
                                     var.name.clone().unwrap(),
-                                    ((binding.group, binding.binding), ty.clone()),
+                                    ((binding.group, binding.binding), ty),
                                 );
                                 entry.insert(wgpu::BindGroupLayoutEntry {
                                     binding: binding.binding,
@@ -543,7 +543,7 @@ impl<'a> ShaderEntryPoint<'a> {
             .naga_module
             .entry_points
             .iter()
-            .position(|ep| &ep.name == name)
+            .position(|ep| ep.name == name)
             .unwrap_or_else(|| {
                 panic!(
                     "Shader '{}' doesn't have entry point '{}'.",

@@ -25,27 +25,22 @@ struct DrawCmd {
     first_instance: u32;
 };
 
-[[block]]
 struct MeshBuffer {
     meshes: array<Mesh>;
 };
 
-[[block]]
 struct MeshDrawBuffer {
     mesh_draws: array<MeshDraw>;
 };
 
-[[block]]
 struct CmdBuffer {
     commands: array<DrawCmd>;
 };
 
-[[block]]
 struct VisBuffer {
     vis: array<u32>;
 };
 
-[[block]]
 struct Camera {
     view: mat4x4<f32>;
     projection: mat4x4<f32>;
@@ -54,7 +49,6 @@ struct Camera {
     position: vec3<f32>;
 };
 
-[[block]]
 struct PyramidInfo {
     width: u32;
     height: u32;

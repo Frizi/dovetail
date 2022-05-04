@@ -3,7 +3,10 @@ use std::{f32::consts::PI, fmt::Display, num::NonZeroU32, path::Path};
 use glam::{Mat4, Quat, Vec3, Vec4, Vec4Swizzles};
 use rand::{Rng, SeedableRng};
 use tasks::Spawner;
-use wgpu::util::{BufferInitDescriptor, DeviceExt};
+use wgpu::{
+    util::{BufferInitDescriptor, DeviceExt},
+    QUERY_RESOLVE_BUFFER_ALIGNMENT,
+};
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, Event, ModifiersState, WindowEvent},
@@ -154,7 +157,7 @@ impl Camera {
         Self {
             view,
             projection,
-            view_proj: view_proj,
+            view_proj,
             frustum: [
                 normalize_plane(view_proj.row(3) + view_proj.row(0)),
                 normalize_plane(view_proj.row(3) - view_proj.row(0)),
@@ -178,6 +181,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     let spawner = Spawner::new();
     let instance = wgpu::Instance::new(wgpu::Backends::all());
     let surface = unsafe { instance.create_surface(&window) };
+
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
@@ -209,12 +213,22 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         .await
         .expect("Failed to create device");
 
+    let swapchain_format = surface.get_preferred_format(&adapter).unwrap();
+    let size = window.inner_size();
+
+    let mut surface_config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: swapchain_format,
+        width: size.width,
+        height: size.height,
+        present_mode: wgpu::PresentMode::Mailbox,
+    };
+
+    surface.configure(&device, &surface_config);
+
     // Load the shaders from disk
     let shader = load_shader(&device, "shader.wgsl");
     let reduce_shader = load_shader(&device, "depth_reduce.wgsl");
-
-    let swapchain_format = surface.get_preferred_format(&adapter).unwrap();
-    let size = window.inner_size();
 
     let mut depth_desc = wgpu::TextureDescriptor {
         label: None,
@@ -324,7 +338,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         });
     }
 
-    let num_draws_aligned = (((mesh_draws.len() + 31) / 32) * 32) as u64;
+    let num_draws_aligned = align_to(mesh_draws.len() as u64, 32);
 
     let frame_visibility_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("frame_visibility_buffer"),
@@ -501,11 +515,15 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         count: num_timestamps,
     });
 
+    let timestamps_size = num_timestamps as u64 * std::mem::size_of::<u64>() as u64;
+    let stats_size = num_statistics as u64 * std::mem::size_of::<u64>() as u64;
+    let timestamps_size_aligned = align_to(timestamps_size, QUERY_RESOLVE_BUFFER_ALIGNMENT);
+    let stats_size_aligned = align_to(stats_size, QUERY_RESOLVE_BUFFER_ALIGNMENT);
+
     let timestamp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("timestamp_buffer"),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        size: num_timestamps as u64 * std::mem::size_of::<u64>() as u64
-            + num_statistics as u64 * std::mem::size_of::<u64>() as u64,
+        size: timestamps_size_aligned + stats_size_aligned,
         mapped_at_creation: false,
     });
 
@@ -554,6 +572,10 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                         .bind("pyramid_info", &pyramid_info_buffer)
                         .bind("depth_pyramid_sampler", &pyramid_sampler)
                         .build(&device);
+
+                    surface_config.width = size.width;
+                    surface_config.height = size.height;
+                    surface.configure(&device, &surface_config);
                 }
                 WindowEvent::ModifiersChanged(state) => {
                     modifiers = state;
@@ -720,7 +742,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 });
                 comp_pass.set_pipeline(&cull_early_pipeline);
                 if let Some(group) = &cull_early_bind_group {
-                    comp_pass.set_bind_group(0, &group, &[]);
+                    comp_pass.set_bind_group(0, group, &[]);
                 }
                 comp_pass.dispatch((num_mesh_draws + 31) / 32, 1, 1);
             }
@@ -746,7 +768,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 });
                 render_pass.set_pipeline(&render_pipeline);
                 if let Some(group) = &draw_bind_group {
-                    render_pass.set_bind_group(0, &group, &[]);
+                    render_pass.set_bind_group(0, group, &[]);
                 }
                 render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
@@ -777,10 +799,10 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 });
                 comp_pass.set_pipeline(&cull_late_pipeline);
                 if let Some(group) = &cull_late_bind_group_0 {
-                    comp_pass.set_bind_group(0, &group, &[]);
+                    comp_pass.set_bind_group(0, group, &[]);
                 }
                 if let Some(group) = &cull_late_bind_group_1 {
-                    comp_pass.set_bind_group(1, &group, &[]);
+                    comp_pass.set_bind_group(1, group, &[]);
                 }
                 comp_pass.dispatch((num_mesh_draws + 31) / 32, 1, 1);
             }
@@ -806,7 +828,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 });
                 render_pass.set_pipeline(&render_pipeline);
                 if let Some(group) = &draw_bind_group {
-                    render_pass.set_bind_group(0, &group, &[]);
+                    render_pass.set_bind_group(0, group, &[]);
                 }
                 render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
@@ -821,14 +843,13 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 &statistics_query,
                 0..2,
                 &timestamp_buffer,
-                num_timestamps as u64 * std::mem::size_of::<u64>() as u64,
+                timestamps_size_aligned,
             );
             queue.submit(Some(encoder.finish()));
-            drop(frame);
+            let cpu_time = cpu_time_start.elapsed();
+            frame.present();
 
             spawner.spawn_local(staging_belt.recall());
-
-            let cpu_time = cpu_time_start.elapsed();
 
             let buf_slice = timestamp_buffer.slice(..);
             let _ = buf_slice.map_async(wgpu::MapMode::Read);
@@ -846,12 +867,12 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
             let gpu_time_late = (stats_u64[2] - stats_u64[1]) as f64 * ts_period as f64;
             let gpu_time_total = (stats_u64[2] - stats_u64[0]) as f64 * ts_period as f64;
 
-            let num_vertices_early = stats_u64[num_timestamps as usize + 0];
-            let num_triangles_early = stats_u64[num_timestamps as usize + 1];
-            let num_fragments_early = stats_u64[num_timestamps as usize + 2];
-            let num_vertices_late = stats_u64[num_timestamps as usize + 3];
-            let num_triangles_late = stats_u64[num_timestamps as usize + 4];
-            let num_fragments_late = stats_u64[num_timestamps as usize + 5];
+            let num_vertices_early = stats_u64[timestamps_size_aligned as usize];
+            let num_triangles_early = stats_u64[timestamps_size_aligned as usize + 1];
+            let num_fragments_early = stats_u64[timestamps_size_aligned as usize + 2];
+            let num_vertices_late = stats_u64[timestamps_size_aligned as usize + 3];
+            let num_triangles_late = stats_u64[timestamps_size_aligned as usize + 4];
+            let num_fragments_late = stats_u64[timestamps_size_aligned as usize + 5];
 
             drop(stats);
             timestamp_buffer.unmap();
@@ -992,9 +1013,13 @@ fn make_depth_reduce(
                 .bind("image_src", &last_view)
                 .bind("image_dst", &next_view)
                 .bind("pyramid_info", pyramid_info_buffer)
-                .build(&device);
+                .build(device);
             last_view = next_view;
             bind_group
         })
         .collect()
+}
+
+fn align_to(original_size: u64, alignment: u64) -> u64 {
+    (original_size + alignment - 1) & !(alignment - 1)
 }

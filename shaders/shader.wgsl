@@ -4,13 +4,13 @@
 [[group(0), binding(0)]]
 var<uniform> camera: Camera;
 [[group(0), binding(1)]]
-var<storage> mesh_buffer: [[access(read)]] MeshBuffer;
+var<storage> mesh_buffer: MeshBuffer;
 [[group(0), binding(2)]]
-var<storage> mesh_draw_buffer: [[access(read)]] MeshDrawBuffer;
+var<storage> mesh_draw_buffer: MeshDrawBuffer;
 [[group(0), binding(3)]]
-var<storage> cmd_buffer: [[access(write)]] CmdBuffer;
+var<storage, read_write> cmd_buffer: CmdBuffer;
 [[group(0), binding(4)]]
-var<storage> visibility_buffer: [[access(read_write)]] VisBuffer;
+var<storage, read_write> visibility_buffer: VisBuffer;
 
 [[group(1), binding(0)]]
 var depth_pyramid: texture_2d<f32>;

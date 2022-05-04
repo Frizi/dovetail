@@ -3,7 +3,7 @@
 [[group(0), binding(0)]]
 var image_src: texture_2d<f32>;
 [[group(0), binding(1)]]
-var image_dst: [[access(write)]] texture_storage_2d<r32float>;
+var image_dst: texture_storage_2d<r32float, write>;
 [[group(0), binding(2)]]
 var<uniform> pyramid_info: PyramidInfo;
 
@@ -13,7 +13,7 @@ struct PushConstants {
 
 var<push_constant> push: PushConstants;
 
-[[stage(compute), workgroup_size(32, 32)]]
+[[stage(compute), workgroup_size(16, 16)]]
 fn depth_reduce(
     [[builtin(global_invocation_id)]] global_id: vec3<u32>,
 ) {
